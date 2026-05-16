@@ -1,0 +1,24 @@
+# Runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.zip
+nohup.out
+mcc_supervisor.pid
+supervisor_runtime.log
+hn_pro_max_mcc.log
+chatlog-*.txt
+foreground_test.log
+min_test_run.log
+mcc_direct.log
+Sentry/
+
+# MCC binary - downloaded at build time, not committed (it's an 85MB release artifact)
+MinecraftClient
+
+# Backup configs
+*.backup.ini
+
+# Local secrets
+.env
+*.token

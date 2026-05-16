@@ -1,0 +1,48 @@
+HN_PRO_MAX — Railway Deployment Guide
+=====================================
+
+Recommended deploy mode
+- Use Docker deployment. Railway auto-detects the root `Dockerfile`.
+
+What is already configured
+- Dockerfile installs python3, libicu74, libssl3 (needed by MCC binary), procps, tzdata.
+- CMD is `run_forever.sh` which restarts the supervisor on crash.
+- railway.json sets healthcheckPath=/health and restartPolicyType=ALWAYS.
+
+Steps
+1) Push this folder to GitHub.
+2) Railway → New Project → Deploy from GitHub repo.
+3) Railway detects Dockerfile and builds the container.
+4) Set variables in the Railway service:
+   - OWNER_USERNAMES=.Nirankar66
+   - BOT_USERNAME=HN_PRO_MAX (optional)
+   - MOVEMENT_INTERVAL=1.4 (optional)
+   - SEND_THROTTLE=1.2 (optional)
+5) Deploy. Container starts /app/run_forever.sh which forever-loops mcc_supervisor.py.
+6) Verify: open the service URL and visit /health, you should see JSON.
+
+24/7 reconnection behavior
+- MCC AutoRelog (inside MCC_HN_PRO_MAX.ini) handles in-Minecraft disconnects.
+- run_forever.sh restarts the entire Python supervisor with exponential backoff
+  (5s, 10s, 20s, 40s, 60s, capped at 60s).
+- Railway has restartPolicyType=ALWAYS so the container itself is also restarted
+  if it ever exits.
+
+CLI alternative
+- Install Railway CLI: see https://docs.railway.com/cli
+- Quick deploy:
+    railway login
+    railway init           # link / create project
+    railway up             # upload current directory
+    railway logs --tail
+- Set variables via CLI:
+    railway variables set OWNER_USERNAMES=.Nirankar66
+- More: https://docs.railway.com/cli
+
+Healthcheck
+- Path: /health
+- Returns 200 with JSON body
+
+Logs
+- Railway dashboard → service → "Deploy Logs" / "View Logs"
+- Or via CLI:  railway logs --tail

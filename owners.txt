@@ -1,0 +1,5 @@
+# HN_PRO_MAX owner whitelist
+# One Minecraft in-game username per line (case insensitive).
+# These users have full control over the bot via chat commands.
+# Can also be overridden / extended with OWNER_USERNAMES env var (comma separated).
+.Nirankar66

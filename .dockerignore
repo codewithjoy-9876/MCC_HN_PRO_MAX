@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.zip
+Sentry/
+foreground_test.log
+min_test_run.log
+mcc_direct.log
+nohup.out
+mcc_supervisor.pid
+*.backup.ini
+HNPresenceBot.cs
+AutoAttack.cs
+ChatBot.cs
+min_test.cs
+.git
+.github
