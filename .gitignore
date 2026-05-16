@@ -1,24 +1,28 @@
-# Runtime artifacts
-__pycache__/
-*.pyc
-*.pyo
-*.zip
+# Logs and runtime state
 nohup.out
-mcc_supervisor.pid
 supervisor_runtime.log
 hn_pro_max_mcc.log
 chatlog-*.txt
 foreground_test.log
 min_test_run.log
 mcc_direct.log
-Sentry/
+mcc_supervisor.pid
 
-# MCC binary - downloaded at build time, not committed (it's an 85MB release artifact)
-MinecraftClient
+# Python
+__pycache__/
+*.pyc
+*.pyo
 
-# Backup configs
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Local backups
 *.backup.ini
 
-# Local secrets
-.env
-*.token
+# Sentry / MCC runtime dirs
+Sentry/
+
+# MCC binary (downloaded at build time by Dockerfile / install script)
+MinecraftClient

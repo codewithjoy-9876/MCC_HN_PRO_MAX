@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-HN_PRO_MAX Production Supervisor
-================================
-- Owner-only assistant commands
-- 24/7 reconnection via MCC AutoRelog + Python wrapper
-- Owner inventory workflow (equip / drop / shield)
-- Lumberjack mode skeleton (find/cut/collect/bring wood)
-- Health server for Railway / external monitoring
-- Robust state machine, graceful shutdown, no command spam on disconnect
+HN_PRO_MAX MCC Supervisor (Production v2)
+- Owner-only assistant
+- Inventory workflow (equip/drop)
+- Lumberjack / wood gathering
+- 24/7 auto-reconnect
+- Health endpoint for Railway
+
+Built around the Minecraft Console Client (MCC) v26.1 CLI commands.
+Reference docs:
+  https://mccteam.github.io/guide/usage.html
+  https://mccteam.github.io/guide/chat-bots.html
+  https://github.com/MCCTeam/Minecraft-Console-Client
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import os
 import queue
 import random
@@ -23,733 +26,759 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from typing import Iterable
 
+# =============================================================================
+# Paths and constants
+# =============================================================================
+BASE = os.path.dirname(os.path.abspath(__file__))
+CONFIG = os.path.join(BASE, 'MCC_HN_PRO_MAX.ini')
+MCC = os.path.join(BASE, 'MinecraftClient')
+LOG = os.path.join(BASE, 'supervisor_runtime.log')
+OWNERS_FILE = os.path.join(BASE, 'owners.txt')
 
-# ---------------------------------------------------------------------------
-# Constants and configuration
-# ---------------------------------------------------------------------------
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "MCC_HN_PRO_MAX.ini")
-MCC_PATH = os.path.join(BASE_DIR, "MinecraftClient")
-RUNTIME_LOG = os.path.join(BASE_DIR, "supervisor_runtime.log")
-OWNERS_FILE = os.path.join(BASE_DIR, "owners.txt")
-
-BOT_USERNAME = os.getenv("BOT_USERNAME", "HN_PRO_MAX")
-HEALTH_PORT = int(os.getenv("PORT", "8080"))
-
-# Movement cadence (seconds between supervisor-driven actions)
-MOVEMENT_INTERVAL = float(os.getenv("MOVEMENT_INTERVAL", "1.4"))
-SEND_THROTTLE = float(os.getenv("SEND_THROTTLE", "1.2"))
-
-# Owner identification (case-insensitive)
-DEFAULT_OWNER = ".Nirankar66"
-
-# Bed sleep retry interval
-BED_RETRY_INTERVAL_SECONDS = 120
-BED_REASON_REPEAT_COOLDOWN_SECONDS = 300
-
-# Reply rate-limiting
-GLOBAL_REPLY_COOLDOWN_SECONDS = 3
-DUPLICATE_MSG_WINDOW_SECONDS = 45
-PROACTIVE_CHAT_COOLDOWN_SECONDS = 180
-
-# Lumberjack tuning
-WOOD_SEARCH_RADIUS = 16
-WOOD_TYPES_FOR_DIG = [
-    "OakLog", "BirchLog", "SpruceLog", "JungleLog",
-    "AcaciaLog", "DarkOakLog", "MangroveLog", "CherryLog",
-]
-
-# Hostile mob death pattern
-HOSTILE_DEATH_RE = re.compile(
-    r"HN_PRO_MAX .*?(Zombie|Skeleton|Creeper|Spider|Drowned|Husk|Stray|Phantom|Witch|Vindicator|Pillager)",
-    re.IGNORECASE,
-)
-
-# Disconnect patterns from MCC
+# Regex patterns for parsing MCC stdout
+ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+CHAT_RE = re.compile(r'^(?:\d{2}:\d{2}:\d{2}\s+)?\*\s+(\S+)\s+(.+)$')
+WHISPER_RE = re.compile(r'^(?:\d{2}:\d{2}:\d{2}\s+)?(\S+)\s+whispers to you:\s+(.+)$', re.I)
+JOIN_RE = re.compile(r'^(?:\d{2}:\d{2}:\d{2}\s+)?([^\s]+) joined the game$')
+LEAVE_RE = re.compile(r'^(?:\d{2}:\d{2}:\d{2}\s+)?([^\s]+) left the game$')
 DISCONNECT_RE = re.compile(
-    r"(Disconnected by Server"
-    r"|Connection has been lost"
-    r"|Cannot send text: not connected to a server"
-    r"|Failed to decode packet .*interact"
-    r"|Received unknown packet id"
-    r"|A timeout occured)",
-    re.IGNORECASE,
+    r'(Disconnected by Server|Connection has been lost|Cannot send text: not connected to a server'
+    r'|Failed to decode packet .*interact|Received unknown packet id|A timeout occured)',
+    re.I,
 )
+HOSTILE_DEATH_RE = re.compile(
+    r'HN_PRO_MAX .*?(Zombie|Skeleton|Creeper|Spider|Drowned|Husk|Stray|Phantom|Witch|Pillager|Vindicator)',
+    re.I,
+)
+SERVER_JOIN_RE = re.compile(r'Server was successfully joined', re.I)
+SELF_SPAWN_RE = re.compile(r'HN_PRO_MAX joined the game', re.I)
+LOCATION_RE = re.compile(r'X:(-?\d+\.\d+)\s+Y:(-?\d+\.\d+)\s+Z:(-?\d+\.\d+)')
 
-# Chat line pattern from MCC (matches "* <player> <message>" or with timestamp)
-CHAT_RE = re.compile(r"^(?:\d{2}:\d{2}:\d{2}\s+)?\*\s+(\S+)\s+(.+)$")
-JOIN_RE = re.compile(r"^(?:\d{2}:\d{2}:\d{2}\s+)?(\S+) joined the game$")
-LEAVE_RE = re.compile(r"^(?:\d{2}:\d{2}:\d{2}\s+)?(\S+) left the game$")
-
-# Bed reason translation
+# Bed sleep failure -> human-friendly reason mapping
 BED_REASON_PATTERNS = [
-    (re.compile(r"Could not find a bed", re.IGNORECASE), "nearby bed nahi mila"),
-    (re.compile(r"Can not reach the bed safely", re.IGNORECASE), "bed tak safely pahunch nahi pa raha"),
-    (re.compile(r"Failed to reach the bed position", re.IGNORECASE), "bed tak time par nahi pahunch saka"),
-    (re.compile(r"not a bed", re.IGNORECASE), "jo block mila wo bed nahi tha"),
-    (re.compile(r"bed is occupied", re.IGNORECASE), "bed occupied hai"),
-    (re.compile(r"bed is obstructed", re.IGNORECASE), "bed obstructed hai"),
-    (re.compile(r"too far away", re.IGNORECASE), "bed bahut door hai"),
-    (re.compile(r"monsters nearby", re.IGNORECASE), "nearby hostile mobs hain"),
-    (re.compile(r"only at night|during thunderstorms", re.IGNORECASE), "abhi raat ya thunderstorm nahi hai"),
-    (re.compile(r"Could not lay in bed", re.IGNORECASE), "bed use karne ki condition poori nahi hui"),
+    (re.compile(r'Could not find a bed', re.I), 'nearby bed nahi mila'),
+    (re.compile(r'Can not reach the bed safely', re.I), 'bed tak safely pahunch nahi pa raha'),
+    (re.compile(r'Failed to reach the bed position', re.I), 'bed tak time par nahi pahunch saka'),
+    (re.compile(r'not a bed', re.I), 'wo block bed nahi tha'),
+    (re.compile(r'bed is occupied', re.I), 'bed occupied hai'),
+    (re.compile(r'bed is obstructed', re.I), 'bed obstructed hai'),
+    (re.compile(r'too far away', re.I), 'bed bahut door hai'),
+    (re.compile(r'monsters nearby', re.I), 'nearby hostile mobs hain'),
+    (re.compile(r'only at night|during thunderstorms', re.I), 'abhi raat ya thunderstorm nahi hai'),
+    (re.compile(r'Could not lay in bed', re.I), 'bed use karne ki condition poori nahi hui'),
 ]
 
-# ANSI cleanup
-ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+# Wood log block materials that MCC understands (Minecraft 1.21.x logs)
+LOG_BLOCKS = [
+    'OakLog', 'SpruceLog', 'BirchLog', 'JungleLog', 'AcaciaLog', 'DarkOakLog',
+    'MangroveLog', 'CherryLog', 'PaleOakLog', 'CrimsonStem', 'WarpedStem',
+]
 
+# =============================================================================
+# Global runtime state
+# =============================================================================
+stop_flag = False
+joined = False
+connected_once = False
+process_started_at = datetime.now(timezone.utc)
+active_after = datetime.min.replace(tzinfo=timezone.utc)
+panic_until = datetime.min.replace(tzinfo=timezone.utc)
+next_bed_attempt_at = datetime.min.replace(tzinfo=timezone.utc)
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+follow_target = ''
+protect_target = ''
+mode = 'patrol'              # patrol | follow | protect | lumberjack | idle
+lumberjack_state = 'idle'    # idle | searching | chopping | returning | dropping
+lumberjack_owner = ''
+trees_chopped_count = 0
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+last_seen_player = ''
+last_seen_player_at = datetime.min.replace(tzinfo=timezone.utc)
+last_reply_at = datetime.min.replace(tzinfo=timezone.utc)
+last_proactive_at = datetime.min.replace(tzinfo=timezone.utc)
+last_bed_reason = ''
+last_bed_announce_at = datetime.min.replace(tzinfo=timezone.utc)
+last_health_warning_at = datetime.min.replace(tzinfo=timezone.utc)
+bot_location: tuple[float, float, float] | None = None
 
+recent_sender_msg: dict[str, tuple[str, datetime]] = {}
+recent_reply: dict[str, str] = {}
+cmd_q: 'queue.Queue[str]' = queue.Queue()
+move_index = 0
+owners: set[str] = set()
+STATE = SimpleNamespace(owners=owners)
+health_server_started = False
+process_handle: subprocess.Popen | None = None
 
-class _Logger:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.Lock()
-        try:
-            open(self.path, "w", encoding="utf-8").write("")
-        except OSError:
-            pass
-
-    def log(self, *parts: object) -> None:
-        line = f"{utcnow().isoformat()} " + " ".join(str(p) for p in parts)
-        with self._lock:
-            print(line, flush=True)
-            try:
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            except OSError:
-                pass
-
-
-LOG = _Logger(RUNTIME_LOG)
-
-
-# ---------------------------------------------------------------------------
-# Owner whitelist
-# ---------------------------------------------------------------------------
-
-def normalize_name(name: str) -> str:
-    return name.strip().lower()
-
-
-def load_owners() -> set[str]:
-    found: set[str] = set()
-    env_value = os.getenv("OWNER_USERNAMES", "").strip()
-    if env_value:
-        for item in env_value.split(","):
-            item = item.strip()
-            if item:
-                found.add(normalize_name(item))
-    if os.path.exists(OWNERS_FILE):
-        try:
-            with open(OWNERS_FILE, "r", encoding="utf-8") as f:
-                for raw in f:
-                    text = raw.strip()
-                    if text and not text.startswith("#"):
-                        found.add(normalize_name(text))
-        except OSError as exc:
-            LOG.log("[owners-read-error]", repr(exc))
-    if not found:
-        found.add(normalize_name(DEFAULT_OWNER))
-    return found
-
-
-# ---------------------------------------------------------------------------
-# Bot state
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BotState:
-    stop_flag: bool = False
-    joined: bool = False
-    connected_once: bool = False
-    active_after: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
-    follow_target: str = ""
-    protect_target: str = ""
-    last_seen_player: str = ""
-    last_seen_player_at: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
-    last_reply_at: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
-    panic_until: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
-    next_bed_attempt_at: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
-    last_bed_reason: str = ""
-    last_bed_announce_at: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
-    last_proactive_at: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
-    process_started_at: datetime = field(default_factory=utcnow)
-    owners: set[str] = field(default_factory=set)
-    recent_sender_msg: dict[str, tuple[str, datetime]] = field(default_factory=dict)
-    recent_reply: dict[str, str] = field(default_factory=dict)
-    move_index: int = 0
-    mode: str = "patrol"  # patrol | follow | protect | lumberjack
-    lumberjack_owner: str = ""
-
-
-STATE = BotState()
-CMD_QUEUE: "queue.Queue[str]" = queue.Queue()
-HEALTH_SERVER_STARTED = False
-
-
-# ---------------------------------------------------------------------------
-# Movement / reply pools
-# ---------------------------------------------------------------------------
-
-MOVEMENT_CYCLE = [
-    "/look north",
-    "/move north -f",
-    "/animation mainhand",
-    "/look east",
-    "/move east -f",
-    "/sneak",
-    "/look south",
-    "/move south -f",
-    "/animation mainhand",
-    "/look west",
-    "/move west -f",
-    "/move center",
+# =============================================================================
+# Movement and dialogue cycles
+# =============================================================================
+PATROL_CYCLE = [
+    '/look north',
+    '/move north -f',
+    '/animation mainhand',
+    '/look east',
+    '/move east -f',
+    '/sneak',
+    '/look south',
+    '/move south -f',
+    '/animation mainhand',
+    '/look west',
+    '/move west -f',
+    '/move center',
 ]
 
 PANIC_CYCLE = [
-    "/look south",
-    "/move south -f",
-    "/move west -f",
-    "/look east",
-    "/move east -f",
-    "/move north -f",
-    "/move center",
+    '/look south',
+    '/move south -f',
+    '/move west -f',
+    '/look east',
+    '/move east -f',
+    '/move north -f',
+    '/move center',
 ]
 
 HELLO_LINES = [
-    "hey owner, online hoon",
-    "haan owner, yahin hoon",
-    "sun raha hoon, bolo",
-    "owner mode active hai",
+    'hey owner, online hoon 👋',
+    'haan owner, yahin hoon.',
+    'sun raha hoon, bolo.',
+    'owner mode active hai.',
 ]
 STATUS_LINES = [
-    "main online hoon aur chat dekh raha hoon",
-    "alive hoon, movement bhi on hai",
-    "server par hoon, sun raha hoon",
+    'main online hoon aur chat dekh raha hoon.',
+    'alive hoon, movement bhi on hai.',
+    'server par hoon, sun raha hoon.',
 ]
 FOLLOW_LINES = [
-    "aa raha hoon",
-    "theek hai, follow kar raha hoon",
-    "coming to you",
+    'aa raha hoon.',
+    'theek hai, follow kar raha hoon.',
+    'coming to you.',
 ]
 STOP_LINES = [
-    "theek hai, ruk gaya",
-    "ok, yahin stay karta hoon",
-    "follow stop kar diya",
+    'theek hai, ruk gaya.',
+    'ok, yahin stay karta hoon.',
+    'follow stop kar diya.',
 ]
 UNKNOWN_LINES = [
-    "samjha, aur bolo",
-    "suna maine",
-    "theek, note kar liya",
+    'samjha owner, aur bolo.',
+    'suna maine.',
+    'theek, note kar liya.',
 ]
 PROACTIVE_LINES = [
-    "owner, koi help chahiye toh bolo",
-    "main nearby active hoon",
-    "commands: come here / stop / status / sleep now / protect me",
-    "main idle nahi hoon, active patrol par hoon",
+    'owner, koi help chahiye toh bolo.',
+    'main nearby active hoon.',
+    'commands: come here / stay / status / sleep now / protect me / gather wood',
+    'main idle nahi hoon, active patrol par hoon.',
 ]
+PROTECT_LINES = [
+    'protect mode active, nearby hostile par nazar hai.',
+    'mai aapko cover kar raha hoon.',
+    'guard mode on.',
+]
+EQUIP_SLOT_MAP = {
+    'sword': 1,
+    'axe': 2,
+    'pickaxe': 3,
+    'shovel': 4,
+    'shield': 5,   # treated as offhand-ish; MCC will use slot 5
+    'food': 6,
+    'block': 7,
+}
+
+# =============================================================================
+# Utility helpers
+# =============================================================================
+def now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
+def log(*parts) -> None:
+    line = f"{now().isoformat()} " + ' '.join(str(p) for p in parts)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        with open(LOG, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception:
+        pass
 
-def clean_line(line: str) -> str:
-    line = ANSI_RE.sub("", line)
-    return line.replace("\u258c", "").replace("\r", "").strip()
+
+def clean(line: str) -> str:
+    line = ANSI_RE.sub('', line)
+    return line.replace('\u258c', '').replace('\r', '').strip()
+
+
+def normalize_player_name(name: str) -> str:
+    return name.strip().lower()
 
 
 def normalize_msg(msg: str) -> str:
-    return re.sub(r"\s+", " ", msg.strip().lower())
+    return re.sub(r'\s+', ' ', msg.strip().lower())
+
+
+def load_owners() -> set[str]:
+    loaded: set[str] = set()
+    env_owners = os.getenv('OWNER_USERNAMES', '').strip()
+    if env_owners:
+        for part in env_owners.split(','):
+            part = part.strip()
+            if part:
+                loaded.add(normalize_player_name(part))
+    if os.path.exists(OWNERS_FILE):
+        try:
+            with open(OWNERS_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        loaded.add(normalize_player_name(line))
+        except Exception as e:
+            log('[owners-load-error]', repr(e))
+    if not loaded:
+        loaded.add(normalize_player_name('.Nirankar66'))
+    return loaded
 
 
 def is_owner(name: str) -> bool:
-    return normalize_name(name) in STATE.owners
+    current_owners = getattr(STATE, 'owners', None) or owners
+    return normalize_player_name(name) in current_owners
 
 
-def enqueue(text: str, source: str = "auto") -> None:
-    CMD_QUEUE.put(text)
-    LOG.log("[queue]", f"src={source}", text)
+def enqueue(text: str) -> None:
+    if not text:
+        return
+    cmd_q.put(text)
+    log('[queue]', text)
 
 
-def clear_pending_commands(reason: str = "") -> None:
+def clear_pending_commands() -> None:
     cleared = 0
     while True:
         try:
-            CMD_QUEUE.get_nowait()
+            cmd_q.get_nowait()
             cleared += 1
         except queue.Empty:
             break
     if cleared:
-        LOG.log("[queue-clear]", f"cleared={cleared}", reason)
+        log('[queue-clear]', f'cleared={cleared}')
 
 
-# ---------------------------------------------------------------------------
-# Send loop (writes to MCC stdin)
-# ---------------------------------------------------------------------------
-
+# =============================================================================
+# IO loops
+# =============================================================================
 def send_loop(proc: subprocess.Popen) -> None:
-    while not STATE.stop_flag and proc.poll() is None:
+    """Drain command queue into MCC stdin at a safe rate."""
+    while not stop_flag and proc.poll() is None:
         try:
-            cmd = CMD_QUEUE.get(timeout=1.0)
+            cmd = cmd_q.get(timeout=1)
         except queue.Empty:
             continue
-        # Drop everything if not in joined state, except /quit
-        if not STATE.joined and cmd != "/quit":
-            LOG.log("[send-skip-disconnected]", cmd)
+        if not joined and cmd != '/quit':
+            log('[send-skip-disconnected]', cmd)
             continue
         try:
-            if proc.stdin is None:
-                LOG.log("[send-error]", "stdin closed")
-                break
-            proc.stdin.write(cmd + "\n")
+            assert proc.stdin is not None
+            proc.stdin.write(cmd + '\n')
             proc.stdin.flush()
-            LOG.log("[send]", cmd)
-        except Exception as exc:  # noqa: BLE001
-            LOG.log("[send-error]", repr(exc))
+            log('[send]', cmd)
+        except Exception as e:
+            log('[send-error]', repr(e))
             break
-        time.sleep(SEND_THROTTLE)
+        time.sleep(1.2)
 
 
-# ---------------------------------------------------------------------------
-# Owner command parser and handlers
-# ---------------------------------------------------------------------------
+def movement_loop() -> None:
+    """Drive non-idle movement and periodic auto-actions."""
+    global move_index, next_bed_attempt_at, last_proactive_at
+    while not stop_flag:
+        if joined:
+            t = now()
+            if t < active_after:
+                time.sleep(1.0)
+                continue
 
-COMMAND_KEYWORDS = {
-    "follow": ["come here", "idhar aa", "mere paas aa", "follow me", "follow kro", "follow karo", "come to me"],
-    "stop": ["stop", "ruk ja", "ruko", "stay here", "stay", "mat aao", "follow stop"],
-    "status": ["status", "alive", "online", "kahan ho", "kahaan ho", "bot status"],
-    "help": ["help", "madad", "commands"],
-    "sleep_now": ["sleep now", "so ja", "soja", "bed use", "go to bed"],
-    "protect_me": ["protect me", "guard me", "raksha karo", "bachao"],
-    "owner": ["who is owner", "owners list", "owner list"],
-    "equip_sword": ["equip sword", "sword nikalo", "sword le", "take sword"],
-    "equip_axe": ["equip axe", "axe nikalo", "axe le", "take axe"],
-    "equip_pickaxe": ["equip pickaxe", "pickaxe nikalo"],
-    "equip_shield": ["use shield", "shield use", "shield uthao", "raise shield"],
-    "drop_logs": ["drop logs", "logs do", "give logs", "wood do", "drop wood"],
-    "drop_food": ["drop food", "food do", "give food", "khana do"],
-    "drop_all": ["drop all", "sab drop"],
-    "find_trees": ["find trees", "find tree", "locate trees", "tree dhundo"],
-    "cut_logs": ["cut logs", "cut tree", "chop tree", "log kaato", "wood kaato"],
-    "collect_wood": ["collect wood", "wood collect", "wood uthao", "logs collect"],
-    "bring_wood": ["bring wood", "bring logs", "wood lao", "logs lao"],
-    "lumberjack": ["lumberjack", "lumberjack mode", "wood mode"],
-    "hello": ["hi", "hello", "hey", "namaste", "yo"],
-}
+            # Periodic sleep check
+            if t >= next_bed_attempt_at and mode in ('patrol', 'follow', 'protect'):
+                enqueue('/bed sleep 8')
+                next_bed_attempt_at = t + timedelta(seconds=180)
+
+            # Decide cycle based on mode
+            if mode == 'lumberjack':
+                pass  # lumberjack loop drives its own movement
+            elif mode == 'follow' and follow_target:
+                if move_index % 2 == 0:
+                    enqueue('/look north' if move_index % 4 == 0 else '/look east')
+                else:
+                    enqueue('/animation mainhand')
+            elif mode == 'protect' and protect_target:
+                if move_index % 3 == 0:
+                    enqueue('/animation mainhand')
+                elif move_index % 3 == 1:
+                    enqueue('/look ' + random.choice(['north', 'east', 'south', 'west']))
+                else:
+                    enqueue('/sneak')
+            else:
+                cycle = PANIC_CYCLE if t < panic_until else PATROL_CYCLE
+                enqueue(cycle[move_index % len(cycle)])
+
+            # Periodic proactive chat
+            if (
+                last_seen_player
+                and is_owner(last_seen_player)
+                and (t - last_seen_player_at).total_seconds() < 300
+                and (t - last_proactive_at).total_seconds() > 180
+            ):
+                enqueue(f'@{last_seen_player} {random.choice(PROACTIVE_LINES)}')
+                last_proactive_at = t
+
+            # Ask MCC to report current location
+            if move_index % 8 == 0:
+                enqueue('/move get')
+
+            move_index += 1
+        time.sleep(1.2)
+
+
+def lumberjack_loop() -> None:
+    """High-level state machine for wood gathering."""
+    global lumberjack_state, trees_chopped_count
+    while not stop_flag:
+        if mode != 'lumberjack' or not joined:
+            time.sleep(1.5)
+            continue
+        try:
+            if lumberjack_state == 'idle':
+                lumberjack_state = 'searching'
+                enqueue('/changeslot 2')  # axe slot
+                enqueue('/animation mainhand')
+                log('[lumberjack]', 'state=searching, switched to axe slot 2')
+                time.sleep(2.0)
+            elif lumberjack_state == 'searching':
+                for log_type in LOG_BLOCKS:
+                    enqueue(f'/move <{log_type}> 16')
+                time.sleep(8.0)
+                lumberjack_state = 'chopping'
+                log('[lumberjack]', 'state=chopping')
+            elif lumberjack_state == 'chopping':
+                for _ in range(6):
+                    enqueue('/dig')
+                    time.sleep(1.6)
+                enqueue('/animation mainhand')
+                trees_chopped_count += 1
+                log('[lumberjack]', f'state=chopping done, trees_chopped={trees_chopped_count}')
+                if trees_chopped_count >= 3:
+                    lumberjack_state = 'returning'
+                else:
+                    lumberjack_state = 'searching'
+            elif lumberjack_state == 'returning':
+                if lumberjack_owner:
+                    enqueue(f'/follow start {lumberjack_owner}')
+                time.sleep(10.0)
+                lumberjack_state = 'dropping'
+                log('[lumberjack]', 'state=dropping')
+            elif lumberjack_state == 'dropping':
+                for log_type in LOG_BLOCKS:
+                    enqueue(f'/dropitem {log_type}')
+                enqueue('/follow stop')
+                if lumberjack_owner:
+                    enqueue(f'@{lumberjack_owner} wood deliver kar diya owner.')
+                trees_chopped_count = 0
+                lumberjack_state = 'idle'
+                set_mode('patrol')
+                log('[lumberjack]', 'cycle complete, reverted to patrol mode')
+        except Exception as e:
+            log('[lumberjack-error]', repr(e))
+            lumberjack_state = 'idle'
+            set_mode('patrol')
+        time.sleep(1.5)
+
+
+# =============================================================================
+# Mode handling
+# =============================================================================
+def set_mode(new_mode: str) -> None:
+    global mode
+    if mode != new_mode:
+        log('[mode-change]', f'{mode} -> {new_mode}')
+    mode = new_mode
+
+
+def reset_runtime_after_disconnect() -> None:
+    global joined, active_after, follow_target, protect_target, lumberjack_state, trees_chopped_count
+    joined = False
+    active_after = datetime.min.replace(tzinfo=timezone.utc)
+    follow_target = ''
+    protect_target = ''
+    lumberjack_state = 'idle'
+    trees_chopped_count = 0
+    clear_pending_commands()
+    set_mode('patrol')
+
+
+# =============================================================================
+# Owner command intent parser
+# =============================================================================
+def command_from_message(msg: str) -> tuple[str, dict]:
+    """Return (intent, params) for owner messages."""
+    m = normalize_msg(msg)
+    params: dict = {}
+
+    if any(x in m for x in ['come here', 'idhar aa', 'mere paas aa', 'follow me', 'follow karo', 'come to me']):
+        return 'follow', params
+    if any(x in m for x in ['stay', 'stop', 'ruk', 'mat aao', 'rukja', 'ruko']):
+        return 'stay', params
+    if any(x in m for x in ['status', 'alive', 'online', 'kahan ho', 'kahaan ho', 'mode']):
+        return 'status', params
+    if 'sleep' in m and 'can' not in m:
+        return 'sleep_now', params
+    if any(x in m for x in ['protect me', 'guard me', 'cover me', 'protect karo', 'mera saath de']):
+        return 'protect', params
+
+    # Inventory / equipment
+    for tool, slot in EQUIP_SLOT_MAP.items():
+        if f'equip {tool}' in m or f'use {tool}' in m or f'{tool} equip' in m:
+            params['tool'] = tool
+            params['slot'] = slot
+            return 'equip', params
+    if 'use shield' in m or 'shield use' in m:
+        params['tool'] = 'shield'
+        params['slot'] = EQUIP_SLOT_MAP['shield']
+        return 'equip', params
+
+    # Drop intents
+    if 'drop logs' in m or 'drop wood' in m or 'log de' in m or 'wood de' in m:
+        params['kind'] = 'logs'
+        return 'drop', params
+    if 'drop food' in m or 'khana de' in m or 'food de' in m:
+        params['kind'] = 'food'
+        return 'drop', params
+    if 'drop all' in m:
+        params['kind'] = 'all'
+        return 'drop', params
+    if m.startswith('drop ') or 'drop item' in m:
+        params['kind'] = 'item'
+        return 'drop', params
+
+    # Lumberjack
+    if 'find trees' in m or 'find wood' in m or 'find forest' in m:
+        return 'find_trees', params
+    if 'cut logs' in m or 'cut wood' in m or 'cut tree' in m or 'chop tree' in m:
+        return 'cut_logs', params
+    if 'gather wood' in m or 'collect wood' in m or 'wood gather' in m or 'lumberjack' in m:
+        return 'gather_wood', params
+    if 'bring wood' in m or 'bring logs' in m or 'wood lao' in m:
+        return 'bring_wood', params
+
+    if 'help' in m or 'commands' in m or 'madad' in m:
+        return 'help', params
+    if any(x in m for x in ['hi', 'hello', 'hey', 'namaste', 'yo']):
+        return 'hello', params
+    if any(x in m for x in ['owner', 'owners']):
+        return 'owner_list', params
+    return 'chat', params
 
 
 def detect_command(msg: str) -> str:
-    text = normalize_msg(msg)
-    # Order-sensitive: more specific phrases first
-    priority = [
-        "find_trees", "cut_logs", "collect_wood", "bring_wood", "lumberjack",
-        "equip_sword", "equip_axe", "equip_pickaxe", "equip_shield",
-        "drop_logs", "drop_food", "drop_all",
-        "sleep_now", "protect_me", "follow", "stop",
-        "status", "owner", "help", "hello",
-    ]
-    for key in priority:
-        for phrase in COMMAND_KEYWORDS.get(key, []):
-            if phrase in text:
-                return key
-    return "chat"
+    """Backward-compatible intent labels for tests and external tooling."""
+    normalized = normalize_msg(msg)
+    if 'lumberjack mode' in normalized:
+        return 'lumberjack'
+    intent, params = command_from_message(msg)
+    legacy_map = {
+        'follow': 'follow',
+        'stay': 'stop',
+        'status': 'status',
+        'sleep_now': 'sleep_now',
+        'protect': 'protect_me',
+        'find_trees': 'find_trees',
+        'cut_logs': 'cut_logs',
+        'bring_wood': 'bring_wood',
+        'help': 'help',
+        'hello': 'hello',
+        'owner_list': 'owner',
+        'chat': 'chat',
+    }
+    if intent == 'equip':
+        return f"equip_{params.get('tool', 'item')}"
+    if intent == 'drop':
+        kind = params.get('kind', 'item')
+        if kind == 'logs':
+            return 'drop_logs'
+        if kind == 'food':
+            return 'drop_food'
+        if kind == 'all':
+            return 'drop_all'
+        return 'drop_item'
+    if intent == 'gather_wood':
+        if 'collect wood' in normalized:
+            return 'collect_wood'
+        if 'lumberjack' in normalized:
+            return 'lumberjack'
+        return 'gather_wood'
+    return legacy_map.get(intent, intent)
 
 
 def send_public_reply(sender: str, text: str) -> None:
-    reply = f"@{sender} {text}"
-    last = STATE.recent_reply.get(sender.lower())
+    reply = f'@{sender} {text}'
+    last = recent_reply.get(sender.lower())
     if last == reply:
         return
-    enqueue(reply, source="reply")
-    STATE.recent_reply[sender.lower()] = reply
+    enqueue(reply)
+    recent_reply[sender.lower()] = reply
 
 
-def cmd_follow(sender: str) -> None:
-    STATE.follow_target = sender
-    STATE.protect_target = ""
-    STATE.mode = "follow"
-    enqueue(f"/follow start {sender}", source="cmd")
-    send_public_reply(sender, random.choice(FOLLOW_LINES))
+def handle_owner_intent(sender: str, intent: str, params: dict) -> None:
+    """Translate intent into one or more MCC commands."""
+    global follow_target, protect_target, lumberjack_owner
 
-
-def cmd_stop(sender: str) -> None:
-    STATE.follow_target = ""
-    STATE.protect_target = ""
-    STATE.mode = "patrol"
-    enqueue("/follow stop", source="cmd")
-    send_public_reply(sender, random.choice(STOP_LINES))
-
-
-def cmd_status(sender: str) -> None:
-    mode = STATE.mode
-    if STATE.follow_target:
-        mode = f"follow={STATE.follow_target}"
-    if STATE.protect_target:
-        mode = f"protect={STATE.protect_target}"
-    msg = f"{random.choice(STATUS_LINES)} | mode={mode}"
-    send_public_reply(sender, msg)
-
-
-def cmd_help(sender: str) -> None:
-    send_public_reply(
-        sender,
-        "cmds: come here, stay, status, sleep now, protect me, equip sword/axe/pickaxe, use shield, drop logs/food, find trees, cut logs, bring wood",
-    )
-
-
-def cmd_sleep_now(sender: str) -> None:
-    enqueue("/bed sleep 8", source="cmd")
-    send_public_reply(sender, "nearby bed check kar raha hoon")
-
-
-def cmd_protect_me(sender: str) -> None:
-    STATE.protect_target = sender
-    STATE.follow_target = sender
-    STATE.mode = "protect"
-    enqueue(f"/follow start {sender}", source="cmd")
-    send_public_reply(sender, "protect mode on, pass me rahunga")
-
-
-def cmd_owner(sender: str) -> None:
-    owners = ", ".join(sorted(STATE.owners))
-    send_public_reply(sender, f"owners: {owners}")
-
-
-def equip_item(sender: str, label: str, item_keywords: list[str]) -> None:
-    """
-    Production note: MCC's `dropitem` and `changeslot` work with inventory handling
-    enabled. To "equip" an item, we attempt to switch to a hotbar slot that
-    contains the item by name pattern. Since item discovery requires inventory
-    inspection commands, we issue a layered fallback:
-      1) Cycle hotbar to slot 1 and announce intent (predictable starting state)
-      2) Inform the owner that the bot is trying to equip the requested item
-    Inventory handling must be enabled in MCC config for actual movement of
-    items; if it is not enabled, the announce step is still useful.
-    """
-    LOG.log("[equip-request]", label, item_keywords)
-    # Best-effort: try common hotbar slots; owner can manually arrange inventory
-    enqueue("/changeslot 1", source="cmd")
-    send_public_reply(sender, f"{label} equip karne ki koshish kar raha hoon (hotbar slot 1)")
-
-
-def cmd_equip_sword(sender: str) -> None:
-    equip_item(sender, "sword", ["Sword"])
-
-
-def cmd_equip_axe(sender: str) -> None:
-    equip_item(sender, "axe", ["Axe"])
-
-
-def cmd_equip_pickaxe(sender: str) -> None:
-    equip_item(sender, "pickaxe", ["Pickaxe"])
-
-
-def cmd_equip_shield(sender: str) -> None:
-    LOG.log("[equip-shield-request]")
-    send_public_reply(
-        sender,
-        "shield offhand-equip ke liye custom slot patch chahiye; abhi best-effort mode hai",
-    )
-
-
-def cmd_drop_logs(sender: str) -> None:
-    for wood in WOOD_TYPES_FOR_DIG:
-        enqueue(f"/dropitem {wood}", source="cmd")
-    send_public_reply(sender, "logs drop kar raha hoon, agar inventory me hain")
-
-
-def cmd_drop_food(sender: str) -> None:
-    food_items = ["Bread", "CookedBeef", "CookedPorkchop", "CookedChicken", "CookedMutton", "Apple"]
-    for f in food_items:
-        enqueue(f"/dropitem {f}", source="cmd")
-    send_public_reply(sender, "food drop kar raha hoon, agar mila to")
-
-
-def cmd_drop_all(sender: str) -> None:
-    enqueue("/autodrop on", source="cmd")
-    send_public_reply(sender, "autodrop enabled (everything mode config par depend karta hai)")
-
-
-def cmd_find_trees(sender: str) -> None:
-    LOG.log("[lumberjack-find]", sender)
-    STATE.lumberjack_owner = sender
-    enqueue("/inventory", source="cmd")  # log state
-    send_public_reply(sender, f"nearby {WOOD_SEARCH_RADIUS} blocks me trees scan kar raha hoon")
-
-
-def cmd_cut_logs(sender: str) -> None:
-    """
-    Lumberjack cut routine: attempt to dig logs around the bot. MCC's `dig`
-    command digs a single block at a coordinate, so the supervisor cannot do
-    true tree-cutting without world introspection. We issue a sequence of
-    dig commands for blocks directly in front of the bot at multiple heights,
-    which works for trees the bot is touching.
-    """
-    LOG.log("[lumberjack-cut]", sender)
-    STATE.lumberjack_owner = sender
-    STATE.mode = "lumberjack"
-    # Best-effort: dig blocks directly in front at body and head height
-    enqueue("/look north", source="cmd")
-    enqueue("/dig ~ ~ ~-1", source="cmd")
-    enqueue("/dig ~ ~1 ~-1", source="cmd")
-    enqueue("/dig ~ ~2 ~-1", source="cmd")
-    send_public_reply(sender, "log cutting attempt kar raha hoon (in-front blocks)")
-
-
-def cmd_collect_wood(sender: str) -> None:
-    LOG.log("[lumberjack-collect]", sender)
-    # MCC has an ItemsCollector bot; enable via runtime command if configured
-    enqueue("/itemscollector start", source="cmd")
-    send_public_reply(sender, "dropped items collect karne ki koshish kar raha hoon")
-
-
-def cmd_bring_wood(sender: str) -> None:
-    LOG.log("[lumberjack-bring]", sender)
-    enqueue(f"/follow start {sender}", source="cmd")
-    for wood in WOOD_TYPES_FOR_DIG:
-        enqueue(f"/dropitem {wood}", source="cmd")
-    send_public_reply(sender, "tumhare paas aa raha hoon aur logs drop karunga")
-
-
-def cmd_lumberjack(sender: str) -> None:
-    STATE.lumberjack_owner = sender
-    STATE.mode = "lumberjack"
-    cmd_find_trees(sender)
-
-
-def cmd_hello(sender: str) -> None:
-    send_public_reply(sender, random.choice(HELLO_LINES))
-
-
-def cmd_chat(sender: str, msg: str) -> None:
-    send_public_reply(sender, random.choice(UNKNOWN_LINES))
-
-
-# ---------------------------------------------------------------------------
-# Chat reply routing
-# ---------------------------------------------------------------------------
-
-COMMAND_HANDLERS = {
-    "follow": cmd_follow,
-    "stop": cmd_stop,
-    "status": cmd_status,
-    "help": cmd_help,
-    "sleep_now": cmd_sleep_now,
-    "protect_me": cmd_protect_me,
-    "owner": cmd_owner,
-    "equip_sword": cmd_equip_sword,
-    "equip_axe": cmd_equip_axe,
-    "equip_pickaxe": cmd_equip_pickaxe,
-    "equip_shield": cmd_equip_shield,
-    "drop_logs": cmd_drop_logs,
-    "drop_food": cmd_drop_food,
-    "drop_all": cmd_drop_all,
-    "find_trees": cmd_find_trees,
-    "cut_logs": cmd_cut_logs,
-    "collect_wood": cmd_collect_wood,
-    "bring_wood": cmd_bring_wood,
-    "lumberjack": cmd_lumberjack,
-    "hello": cmd_hello,
-}
+    if intent == 'follow':
+        follow_target = sender
+        enqueue(f'/follow start {sender}')
+        send_public_reply(sender, random.choice(FOLLOW_LINES))
+        set_mode('follow')
+    elif intent == 'stay':
+        follow_target = ''
+        protect_target = ''
+        enqueue('/follow stop')
+        send_public_reply(sender, random.choice(STOP_LINES))
+        set_mode('patrol')
+    elif intent == 'status':
+        extras = []
+        if follow_target:
+            extras.append(f'follow={follow_target}')
+        if protect_target:
+            extras.append(f'protect={protect_target}')
+        if mode == 'lumberjack':
+            extras.append(f'lumberjack_state={lumberjack_state}')
+            extras.append(f'trees={trees_chopped_count}')
+        extras.append(f'mode={mode}')
+        loc = f' loc={bot_location}' if bot_location else ''
+        send_public_reply(
+            sender,
+            f"{random.choice(STATUS_LINES)} [{', '.join(extras)}]{loc}",
+        )
+    elif intent == 'sleep_now':
+        enqueue('/bed sleep 8')
+        send_public_reply(sender, 'theek hai, nearby bed dhoondh raha hoon.')
+    elif intent == 'protect':
+        protect_target = sender
+        follow_target = sender
+        enqueue(f'/follow start {sender}')
+        enqueue('/changeslot 1')  # sword slot
+        send_public_reply(sender, random.choice(PROTECT_LINES))
+        set_mode('protect')
+    elif intent == 'equip':
+        tool = params.get('tool', 'sword')
+        slot = params.get('slot', 1)
+        enqueue(f'/changeslot {slot}')
+        enqueue('/animation mainhand')
+        send_public_reply(sender, f'{tool} equip kiya (hotbar slot {slot}).')
+    elif intent == 'drop':
+        kind = params.get('kind', 'item')
+        if kind == 'logs':
+            for log_type in LOG_BLOCKS:
+                enqueue(f'/dropitem {log_type}')
+            send_public_reply(sender, 'sab logs drop kar raha hoon.')
+        elif kind == 'food':
+            for food in ['Bread', 'CookedBeef', 'CookedPorkchop', 'CookedChicken', 'CookedMutton', 'Apple', 'BakedPotato', 'Carrot']:
+                enqueue(f'/dropitem {food}')
+            send_public_reply(sender, 'food items drop kar raha hoon.')
+        elif kind == 'all':
+            enqueue('/dropitem')
+            send_public_reply(sender, 'full inventory drop abhi limited hai, hand ka item drop kiya.')
+        else:
+            enqueue('/dropitem')
+            send_public_reply(sender, 'hand ka item drop kiya.')
+    elif intent == 'find_trees':
+        for log_type in LOG_BLOCKS:
+            enqueue(f'/move <{log_type}> 24')
+        send_public_reply(sender, 'forest scan kar raha hoon, nearest log dhoond raha hoon.')
+    elif intent == 'cut_logs':
+        enqueue('/changeslot 2')
+        for _ in range(4):
+            enqueue('/dig')
+        send_public_reply(sender, 'log cut kar raha hoon.')
+    elif intent == 'gather_wood':
+        lumberjack_owner = sender
+        set_mode('lumberjack')
+        send_public_reply(sender, 'lumberjack mode on. wood gather karke wapas aaunga.')
+    elif intent == 'bring_wood':
+        lumberjack_owner = sender
+        # Move directly to dropping phase if we already have wood
+        globals()['lumberjack_state'] = 'returning'
+        set_mode('lumberjack')
+        send_public_reply(sender, 'wood le ke aapke paas aa raha hoon.')
+    elif intent == 'help':
+        send_public_reply(
+            sender,
+            'commands: come here, stay, status, sleep now, protect me, '
+            'equip sword/axe/shield, drop logs/food, gather wood, bring wood.',
+        )
+    elif intent == 'owner_list':
+        send_public_reply(sender, f"owners: {', '.join(sorted(owners))}")
+    elif intent == 'hello':
+        send_public_reply(sender, random.choice(HELLO_LINES))
+    else:
+        send_public_reply(sender, random.choice(UNKNOWN_LINES))
 
 
 def maybe_reply(sender: str, msg: str) -> None:
-    if normalize_name(sender) == normalize_name(BOT_USERNAME):
+    """Throttled owner-only reply dispatcher."""
+    global last_reply_at, last_seen_player, last_seen_player_at
+    if normalize_player_name(sender) == 'hn_pro_max':
         return
 
-    now = utcnow()
-    STATE.last_seen_player = sender
-    STATE.last_seen_player_at = now
+    t = now()
+    last_seen_player = sender
+    last_seen_player_at = t
 
     if not is_owner(sender):
-        LOG.log("[ignore-non-owner]", sender, msg)
+        log('[ignore-non-owner]', sender, msg)
         return
 
     key = sender.lower()
     nmsg = normalize_msg(msg)
-    prev_msg, prev_time = STATE.recent_sender_msg.get(key, ("", datetime.min.replace(tzinfo=timezone.utc)))
-    if nmsg == prev_msg and (now - prev_time).total_seconds() < DUPLICATE_MSG_WINDOW_SECONDS:
-        LOG.log("[reply-skip]", "duplicate-player-msg", sender)
+    prev_sender_msg, prev_time = recent_sender_msg.get(key, ('', datetime.min.replace(tzinfo=timezone.utc)))
+    if nmsg == prev_sender_msg and (t - prev_time).total_seconds() < 30:
+        log('[reply-skip]', 'duplicate-player-msg', sender, msg)
         return
-    STATE.recent_sender_msg[key] = (nmsg, now)
+    recent_sender_msg[key] = (nmsg, t)
 
-    if (now - STATE.last_reply_at).total_seconds() < GLOBAL_REPLY_COOLDOWN_SECONDS:
-        LOG.log("[reply-skip]", "global-rate-limit", sender)
+    if (t - last_reply_at).total_seconds() < 2:
+        log('[reply-skip]', 'global-rate-limit', sender, msg)
         return
 
-    cmd = detect_command(msg)
-    handler = COMMAND_HANDLERS.get(cmd)
+    intent, params = command_from_message(msg)
+    log('[intent]', f"sender={sender} intent={intent} params={params}")
     try:
-        if handler is None:
-            cmd_chat(sender, msg)
-        else:
-            if cmd in {"chat", "hello"}:
-                handler(sender)
-            else:
-                handler(sender)
-    except Exception as exc:  # noqa: BLE001
-        LOG.log("[handler-error]", cmd, repr(exc))
-        send_public_reply(sender, "internal error aaya, fir try karo")
+        handle_owner_intent(sender, intent, params)
+    except Exception as e:
+        log('[intent-error]', repr(e))
+        send_public_reply(sender, 'intent process karte hue error aaya, dobara try karo.')
+    last_reply_at = t
 
-    STATE.last_reply_at = now
-
-
-# ---------------------------------------------------------------------------
-# Movement loop
-# ---------------------------------------------------------------------------
-
-def movement_tick() -> None:
-    now = utcnow()
-    if not STATE.joined:
-        return
-    if now < STATE.active_after:
-        return
-
-    # Periodic bed attempt at night
-    if now >= STATE.next_bed_attempt_at:
-        enqueue("/bed sleep 8", source="auto")
-        STATE.next_bed_attempt_at = now + timedelta(seconds=BED_RETRY_INTERVAL_SECONDS)
-        STATE.move_index += 1
-        return
-
-    if STATE.follow_target or STATE.protect_target:
-        # Subtle non-idle actions during follow/protect
-        if STATE.move_index % 2 == 0:
-            enqueue("/look north" if STATE.move_index % 4 == 0 else "/look east", source="auto")
-        else:
-            enqueue("/animation mainhand", source="auto")
-    else:
-        cycle = PANIC_CYCLE if now < STATE.panic_until else MOVEMENT_CYCLE
-        enqueue(cycle[STATE.move_index % len(cycle)], source="auto")
-
-    # Proactive chat to owner if recently seen
-    if (
-        STATE.last_seen_player
-        and is_owner(STATE.last_seen_player)
-        and (now - STATE.last_seen_player_at).total_seconds() < 300
-        and (now - STATE.last_proactive_at).total_seconds() > PROACTIVE_CHAT_COOLDOWN_SECONDS
-    ):
-        enqueue(f"@{STATE.last_seen_player} {random.choice(PROACTIVE_LINES)}", source="auto")
-        STATE.last_proactive_at = now
-
-    STATE.move_index += 1
-
-
-def movement_loop() -> None:
-    while not STATE.stop_flag:
-        try:
-            movement_tick()
-        except Exception as exc:  # noqa: BLE001
-            LOG.log("[movement-error]", repr(exc))
-        time.sleep(MOVEMENT_INTERVAL)
-
-
-# ---------------------------------------------------------------------------
-# Bed reason announcement
-# ---------------------------------------------------------------------------
 
 def translate_bed_reason(line: str) -> str:
-    for rx, reason in BED_REASON_PATTERNS:
+    for rx, txt in BED_REASON_PATTERNS:
         if rx.search(line):
-            return reason
-    return ""
+            return txt
+    return ''
 
 
 def maybe_announce_bed_reason(line: str) -> None:
+    global last_bed_reason, last_bed_announce_at
     reason = translate_bed_reason(line)
     if not reason:
         return
-    now = utcnow()
-    if reason == STATE.last_bed_reason and (now - STATE.last_bed_announce_at).total_seconds() < BED_REASON_REPEAT_COOLDOWN_SECONDS:
+    t = now()
+    if reason == last_bed_reason and (t - last_bed_announce_at).total_seconds() < 300:
         return
-    target = ""
-    if STATE.last_seen_player and is_owner(STATE.last_seen_player) and (now - STATE.last_seen_player_at).total_seconds() < 600:
-        target = f"@{STATE.last_seen_player} "
-    enqueue(f"{target}abhi so nahi sakta: {reason}", source="auto")
-    STATE.last_bed_reason = reason
-    STATE.last_bed_announce_at = now
+    if last_seen_player and is_owner(last_seen_player) and (t - last_seen_player_at).total_seconds() < 600:
+        enqueue(f'@{last_seen_player} abhi so nahi sakta: {reason}.')
+    else:
+        enqueue(f'abhi so nahi sakta: {reason}.')
+    last_bed_reason = reason
+    last_bed_announce_at = t
 
 
-# ---------------------------------------------------------------------------
-# Health server
-# ---------------------------------------------------------------------------
+def maybe_update_location(line: str) -> None:
+    global bot_location
+    m = LOCATION_RE.search(line)
+    if m:
+        try:
+            bot_location = (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+        except Exception:
+            pass
 
+
+# =============================================================================
+# Health endpoint for Railway
+# =============================================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
-        if self.path not in {"/", "/health", "/healthz"}:
+        if self.path not in ['/', '/health', '/healthz']:
             self.send_response(404)
             self.end_headers()
-            self.wfile.write(b"not found")
+            self.wfile.write(b'not found')
             return
         payload = {
-            "ok": True,
-            "joined": STATE.joined,
-            "connected_once": STATE.connected_once,
-            "mode": STATE.mode,
-            "follow_target": STATE.follow_target,
-            "protect_target": STATE.protect_target,
-            "owners": sorted(list(STATE.owners)),
-            "uptime_seconds": int((utcnow() - STATE.process_started_at).total_seconds()),
+            'ok': True,
+            'joined': joined,
+            'connected_once': connected_once,
+            'mode': mode,
+            'follow_target': follow_target,
+            'protect_target': protect_target,
+            'lumberjack_state': lumberjack_state,
+            'trees_chopped': trees_chopped_count,
+            'owners': sorted(list(getattr(STATE, 'owners', owners))),
+            'last_seen_player': last_seen_player,
+            'bot_location': bot_location,
+            'uptime_seconds': int((datetime.now(timezone.utc) - process_started_at).total_seconds()),
         }
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload).encode('utf-8')
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, format, *args):  # noqa: A002
+    def log_message(self, format, *args):  # silence default logging
         return
 
 
 def start_health_server() -> None:
-    global HEALTH_SERVER_STARTED
-    if HEALTH_SERVER_STARTED:
+    global health_server_started
+    if health_server_started:
         return
+    port = int(os.getenv('PORT', '8080'))
     try:
-        server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
-    except OSError as exc:
-        LOG.log("[health-bind-fail]", repr(exc))
-        return
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    HEALTH_SERVER_STARTED = True
-    LOG.log("[health-server]", f"listening on 0.0.0.0:{HEALTH_PORT}")
+        server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        health_server_started = True
+        log('[health-server]', f'listening on 0.0.0.0:{port}')
+    except OSError as e:
+        log('[health-server-error]', f'port {port} unavailable: {e}')
 
 
-# ---------------------------------------------------------------------------
-# Signal handling
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Lifecycle
+# =============================================================================
+def sig_handler(signum, frame) -> None:
+    global stop_flag
+    stop_flag = True
+    log('[signal]', signum)
 
-def sig_handler(signum, frame):  # noqa: ANN001
-    STATE.stop_flag = True
-    LOG.log("[signal]", signum)
 
+def main() -> int:
+    global stop_flag, joined, connected_once, active_after, next_bed_attempt_at
+    global panic_until, owners, process_handle
 
-# ---------------------------------------------------------------------------
-# MCC process management
-# ---------------------------------------------------------------------------
+    signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGINT, sig_handler)
 
-def launch_mcc() -> subprocess.Popen:
-    LOG.log("[startup]", "launching MCC supervisor")
-    LOG.log("[owners]", ",".join(sorted(STATE.owners)))
-    LOG.log("[config]", CONFIG_PATH)
-    return subprocess.Popen(
-        [MCC_PATH, CONFIG_PATH],
-        cwd=BASE_DIR,
+    open(LOG, 'w', encoding='utf-8').write('')
+    owners = load_owners()
+    STATE.owners = owners
+    log('[startup]', 'launching MCC supervisor (production v2)')
+    log('[owners]', ','.join(sorted(owners)))
+    start_health_server()
+
+    if not os.path.exists(MCC):
+        log('[fatal]', f'MCC binary missing at {MCC}')
+        return 2
+    if not os.path.exists(CONFIG):
+        log('[fatal]', f'MCC config missing at {CONFIG}')
+        return 2
+
+    proc = subprocess.Popen(
+        [MCC, CONFIG],
+        cwd=BASE,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -757,133 +786,111 @@ def launch_mcc() -> subprocess.Popen:
         bufsize=1,
         universal_newlines=True,
     )
+    process_handle = proc
 
-
-def handle_mcc_line(line: str, greeted_session: list[bool]) -> None:
-    LOG.log("[mcc]", line)
-
-    if "Server was successfully joined." in line:
-        STATE.joined = True
-        STATE.connected_once = True
-        greeted_session[0] = False
-        STATE.follow_target = ""
-        STATE.protect_target = ""
-        STATE.mode = "patrol"
-        STATE.active_after = utcnow() + timedelta(seconds=10)
-        STATE.next_bed_attempt_at = utcnow() + timedelta(seconds=35)
-        clear_pending_commands("post-join")
-        return
-
-    if DISCONNECT_RE.search(line):
-        STATE.joined = False
-        STATE.active_after = datetime.min.replace(tzinfo=timezone.utc)
-        STATE.follow_target = ""
-        STATE.protect_target = ""
-        STATE.mode = "patrol"
-        clear_pending_commands("disconnect")
-        LOG.log("[disconnect-detected]", line)
-        return
-
-    if STATE.joined and (not greeted_session[0]) and line.endswith(f"{BOT_USERNAME} joined the game"):
-        greeted_session[0] = True
-        STATE.active_after = utcnow() + timedelta(seconds=8)
-        enqueue(f"{BOT_USERNAME} online. owner-only assistant active, sleep-check active.", source="auto")
-        return
-
-    m = CHAT_RE.match(line)
-    if m:
-        sender, msg = m.group(1), m.group(2)
-        maybe_reply(sender, msg)
-        return
-
-    j = JOIN_RE.match(line)
-    if j:
-        player = j.group(1)
-        if normalize_name(player) != normalize_name(BOT_USERNAME):
-            STATE.last_seen_player = player
-            STATE.last_seen_player_at = utcnow()
-        return
-
-    if LEAVE_RE.match(line):
-        return
-
-    if HOSTILE_DEATH_RE.search(line):
-        STATE.panic_until = utcnow() + timedelta(seconds=20)
-        if not STATE.follow_target and not STATE.protect_target:
-            enqueue("/move south -f", source="auto")
-            enqueue("/move west -f", source="auto")
-        return
-
-    maybe_announce_bed_reason(line)
-
-
-def main_loop() -> int:
-    signal.signal(signal.SIGTERM, sig_handler)
-    signal.signal(signal.SIGINT, sig_handler)
-
-    STATE.owners = load_owners()
-    start_health_server()
-
-    proc = launch_mcc()
     threading.Thread(target=send_loop, args=(proc,), daemon=True).start()
     threading.Thread(target=movement_loop, daemon=True).start()
+    threading.Thread(target=lumberjack_loop, daemon=True).start()
 
-    greeted_session = [False]
-    STATE.next_bed_attempt_at = utcnow() + timedelta(seconds=30)
+    greeted_session = False
+    next_bed_attempt_at = now() + timedelta(seconds=40)
 
     try:
-        while not STATE.stop_flag:
-            if proc.stdout is None:
-                LOG.log("[mcc-stdout-none]")
-                break
+        while not stop_flag:
+            assert proc.stdout is not None
             raw = proc.stdout.readline()
-            if raw == "" and proc.poll() is not None:
+            if raw == '' and proc.poll() is not None:
                 break
             if not raw:
                 time.sleep(0.05)
                 continue
-            line = clean_line(raw)
+
+            line = clean(raw)
             if not line:
                 continue
-            try:
-                handle_mcc_line(line, greeted_session)
-            except Exception as exc:  # noqa: BLE001
-                LOG.log("[handle-line-error]", repr(exc))
+            log('[mcc]', line)
+
+            if SERVER_JOIN_RE.search(line):
+                joined = True
+                connected_once = True
+                greeted_session = False
+                active_after = now() + timedelta(seconds=10)
+                next_bed_attempt_at = now() + timedelta(seconds=40)
+                clear_pending_commands()
+                continue
+
+            if DISCONNECT_RE.search(line):
+                log('[disconnect-detected]', line)
+                reset_runtime_after_disconnect()
+                continue
+
+            if joined and not greeted_session and SELF_SPAWN_RE.search(line):
+                greeted_session = True
+                active_after = now() + timedelta(seconds=8)
+                enqueue('HN_PRO_MAX online. owner-only assistant + lumberjack ready.')
+                continue
+
+            # Player public chat
+            m = CHAT_RE.match(line)
+            if m:
+                sender, msg = m.group(1), m.group(2)
+                maybe_reply(sender, msg)
+                continue
+
+            # Player whispers / private
+            w = WHISPER_RE.match(line)
+            if w:
+                sender, msg = w.group(1), w.group(2)
+                maybe_reply(sender, msg)
+                continue
+
+            # Other players joining
+            j = JOIN_RE.match(line)
+            if j:
+                player = j.group(1)
+                if normalize_player_name(player) != 'hn_pro_max':
+                    globals()['last_seen_player'] = player
+                    globals()['last_seen_player_at'] = now()
+                continue
+
+            if LEAVE_RE.match(line):
+                continue
+
+            # Hostile damage events
+            if HOSTILE_DEATH_RE.search(line):
+                panic_until = now() + timedelta(seconds=20)
+                if mode in ('patrol', 'follow'):
+                    enqueue('/move south -f')
+                    enqueue('/move west -f')
+                continue
+
+            maybe_update_location(line)
+            maybe_announce_bed_reason(line)
+    except Exception as e:
+        log('[main-loop-error]', repr(e))
     finally:
-        STATE.stop_flag = True
+        stop_flag = True
         try:
             if proc.poll() is None:
-                STATE.joined = False
-                clear_pending_commands("shutdown")
+                clear_pending_commands()
                 try:
-                    if proc.stdin and not proc.stdin.closed:
-                        proc.stdin.write("/quit\n")
-                        proc.stdin.flush()
-                except Exception:  # noqa: BLE001
+                    assert proc.stdin is not None
+                    proc.stdin.write('/quit\n')
+                    proc.stdin.flush()
+                except Exception:
                     pass
                 time.sleep(1)
                 proc.terminate()
                 time.sleep(2)
                 if proc.poll() is None:
                     proc.kill()
-        except Exception as exc:  # noqa: BLE001
-            LOG.log("[shutdown-error]", repr(exc))
+        except Exception as e:
+            log('[shutdown-error]', repr(e))
 
-    rc = proc.poll() if proc else None
-    LOG.log("[exit]", f"returncode={rc} connected_once={STATE.connected_once}")
-    return rc if rc is not None else 0
-
-
-def main() -> int:
-    try:
-        return main_loop()
-    except KeyboardInterrupt:
-        LOG.log("[exit]", "KeyboardInterrupt")
-        return 0
-    except Exception as exc:  # noqa: BLE001
-        LOG.log("[fatal]", repr(exc))
-        return 1
+    rc = proc.poll()
+    log('[exit]', f'returncode={rc} connected_once={connected_once}')
+    return 0 if rc in (0, None) else 1
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())
