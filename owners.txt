@@ -1,4 +1,2 @@
-# HN_PRO_MAX owner whitelist
-# One in-game username per line.
-# OWNER_USERNAMES env var (comma separated) is also merged.
-.Nirankar66
+# owner system removed in AFK presence build
+# intentionally unused

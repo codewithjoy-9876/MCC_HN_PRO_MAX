@@ -4,6 +4,7 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
     PORT=8080 \
     TZ=UTC
 
@@ -31,7 +32,7 @@ COPY . /app
 RUN chmod +x /app/run_forever.sh /app/start_bot.sh /app/download_mcc.sh /app/install_mcc.sh || true \
     && /app/download_mcc.sh \
     && chmod +x /app/MinecraftClient || true \
-    && python3 -m py_compile /app/mcc_supervisor.py
+    && python3 -m py_compile /app/mcc_supervisor.py /app/health_server.py
 
 EXPOSE 8080
 

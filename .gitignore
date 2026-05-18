@@ -7,6 +7,7 @@ foreground_test.log
 min_test_run.log
 mcc_direct.log
 mcc_supervisor.pid
+presence_state.json
 
 # Python
 __pycache__/
