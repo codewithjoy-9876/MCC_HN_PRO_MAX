@@ -12,6 +12,7 @@ MIN_TS = datetime.min.replace(tzinfo=timezone.utc)
 def reset_state():
     mod.joined = True
     mod.connected_once = True
+    mod.joined_at = datetime.now(timezone.utc) - timedelta(seconds=30)
     mod.active_after = datetime.now(timezone.utc) - timedelta(seconds=1)
     mod.next_bed_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=30)
     mod.last_bed_attempt_at = MIN_TS
@@ -71,9 +72,27 @@ def test_disconnect_state():
     assert state['disconnect']['last_reason'] == 'Connection has been lost'
 
 
+def test_watchdog_reconnect_timeout():
+    reset_state()
+    mod.joined = False
+    mod.last_disconnect_at = datetime.now(timezone.utc) - timedelta(seconds=mod.REJOIN_GRACE_SECONDS + 5)
+    assert mod.watchdog_reason() == 'reconnect_timeout'
+
+
+def test_watchdog_position_stale():
+    reset_state()
+    mod.joined = True
+    mod.joined_at = datetime.now(timezone.utc) - timedelta(seconds=mod.NO_POSITION_UPDATE_SECONDS + 5)
+    mod.last_position_at = datetime.now(timezone.utc) - timedelta(seconds=mod.NO_POSITION_UPDATE_SECONDS + 5)
+    mod.last_progress_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    assert mod.watchdog_reason() == 'position_updates_stalled'
+
+
 if __name__ == '__main__':
     test_bed_reason_awareness()
     test_player_awareness()
     test_location_progress()
     test_disconnect_state()
+    test_watchdog_reconnect_timeout()
+    test_watchdog_position_stale()
     print('afk presence tests PASSED')

@@ -42,7 +42,7 @@ JOIN_RE = re.compile(r'^(?:\d{2}:\d{2}:\d{2}\s+)?([^\s]+) joined the game$')
 LEAVE_RE = re.compile(r'^(?:\d{2}:\d{2}:\d{2}\s+)?([^\s]+) left the game$')
 DISCONNECT_RE = re.compile(
     r'(Disconnected by Server|Connection has been lost|Cannot send text: not connected to a server'
-    r'|Received unknown packet id|A timeout occured|SocketException: Connection timed out)',
+    r'|Received unknown packet id|A timeout occured|SocketException: Connection timed out|idle for too long)',
     re.I,
 )
 SERVER_JOIN_RE = re.compile(r'Server was successfully joined', re.I)
@@ -94,16 +94,22 @@ process_handle: subprocess.Popen | None = None
 cmd_q: queue.Queue[str] = queue.Queue()
 move_index = 0
 health_server_started = False
+joined_at = datetime.min.replace(tzinfo=timezone.utc)
 
 AFK_MODE = 'afk_presence'
 MOVEMENT_INTERVAL_SECONDS = 1.15
 BED_SCAN_INTERVAL_SECONDS = 50
 CHUNK_LOAD_TARGET = 12
+REJOIN_GRACE_SECONDS = 20
+NO_POSITION_UPDATE_SECONDS = 45
+NO_PROGRESS_RESTART_SECONDS = 150
+WATCHDOG_INTERVAL_SECONDS = 5
 
 MOVEMENT_CYCLE = [
     '/look north',
     '/move north -f',
     '/move center',
+    '/animation mainhand',
     '/look east',
     '/move east -f',
     '/move center',
@@ -111,9 +117,11 @@ MOVEMENT_CYCLE = [
     '/look south',
     '/move south -f',
     '/move center',
+    '/animation mainhand',
     '/look west',
     '/move west -f',
     '/move center',
+    '/sneak',
 ]
 
 
@@ -186,6 +194,44 @@ def movement_state(now_ts: datetime | None = None) -> dict:
     }
 
 
+def seconds_since(ts: datetime, now_ts: datetime | None = None) -> float | None:
+    if ts == datetime.min.replace(tzinfo=timezone.utc):
+        return None
+    t = now_ts or now()
+    return (t - ts).total_seconds()
+
+
+def watchdog_reason(now_ts: datetime | None = None) -> str | None:
+    t = now_ts or now()
+    if connected_once and not joined and last_disconnect_at != datetime.min.replace(tzinfo=timezone.utc):
+        if (t - last_disconnect_at).total_seconds() >= REJOIN_GRACE_SECONDS:
+            return 'reconnect_timeout'
+        return None
+    if not joined:
+        return None
+    if joined_at != datetime.min.replace(tzinfo=timezone.utc) and (t - joined_at).total_seconds() < 15:
+        return None
+    if last_position_at == datetime.min.replace(tzinfo=timezone.utc):
+        if joined_at != datetime.min.replace(tzinfo=timezone.utc) and (t - joined_at).total_seconds() >= NO_POSITION_UPDATE_SECONDS:
+            return 'no_position_updates'
+        return None
+    if (t - last_position_at).total_seconds() >= NO_POSITION_UPDATE_SECONDS:
+        return 'position_updates_stalled'
+    if last_progress_at != datetime.min.replace(tzinfo=timezone.utc) and (t - last_progress_at).total_seconds() >= NO_PROGRESS_RESTART_SECONDS:
+        return 'movement_stalled'
+    return None
+
+
+def watchdog_loop() -> None:
+    while not stop_flag:
+        reason = watchdog_reason()
+        if reason:
+            log('[watchdog]', f'forcing supervisor restart reason={reason}')
+            write_state(force=True)
+            os._exit(17)
+        time.sleep(WATCHDOG_INTERVAL_SECONDS)
+
+
 def state_payload(now_ts: datetime | None = None) -> dict:
     t = now_ts or now()
     next_bed_in = None
@@ -223,6 +269,12 @@ def state_payload(now_ts: datetime | None = None) -> dict:
         'disconnect': {
             'last_reason': last_disconnect_reason or None,
             'last_at': iso_or_none(last_disconnect_at),
+        },
+        'watchdog': {
+            'pending_restart_reason': watchdog_reason(t),
+            'rejoin_grace_seconds': REJOIN_GRACE_SECONDS,
+            'no_position_update_seconds': NO_POSITION_UPDATE_SECONDS,
+            'no_progress_restart_seconds': NO_PROGRESS_RESTART_SECONDS,
         },
     }
     return payload
@@ -307,7 +359,7 @@ def movement_loop() -> None:
                 write_state(force=True)
 
             enqueue(MOVEMENT_CYCLE[move_index % len(MOVEMENT_CYCLE)])
-            if move_index % 4 == 0:
+            if move_index % 2 == 0:
                 enqueue('/move get')
             move_index += 1
             write_state()
@@ -315,9 +367,13 @@ def movement_loop() -> None:
 
 
 def reset_runtime_after_disconnect(reason: str = '') -> None:
-    global joined, active_after, last_disconnect_reason, last_disconnect_at
+    global joined, active_after, last_disconnect_reason, last_disconnect_at, joined_at, bot_location, last_position_at, last_progress_at
     joined = False
+    joined_at = datetime.min.replace(tzinfo=timezone.utc)
     active_after = datetime.min.replace(tzinfo=timezone.utc)
+    bot_location = None
+    last_position_at = datetime.min.replace(tzinfo=timezone.utc)
+    last_progress_at = datetime.min.replace(tzinfo=timezone.utc)
     clear_pending_commands()
     if reason:
         last_disconnect_reason = reason
@@ -433,7 +489,7 @@ def sig_handler(signum, frame) -> None:
 
 
 def main() -> int:
-    global joined, connected_once, active_after, next_bed_attempt_at, process_handle
+    global joined, connected_once, active_after, next_bed_attempt_at, process_handle, joined_at, last_position_at, last_progress_at
 
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
@@ -465,6 +521,7 @@ def main() -> int:
 
     threading.Thread(target=send_loop, args=(proc,), daemon=True).start()
     threading.Thread(target=movement_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
     try:
         while not stop_flag:
@@ -481,11 +538,16 @@ def main() -> int:
             log('[mcc]', line)
 
             if SERVER_JOIN_RE.search(line):
+                join_ts = now()
                 joined = True
                 connected_once = True
-                active_after = now() + timedelta(seconds=8)
-                next_bed_attempt_at = now() + timedelta(seconds=20)
+                joined_at = join_ts
+                active_after = join_ts + timedelta(seconds=8)
+                next_bed_attempt_at = join_ts + timedelta(seconds=20)
+                last_position_at = datetime.min.replace(tzinfo=timezone.utc)
+                last_progress_at = datetime.min.replace(tzinfo=timezone.utc)
                 clear_pending_commands()
+                enqueue('/move get')
                 write_state(force=True)
                 continue
 
