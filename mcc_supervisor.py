@@ -68,6 +68,7 @@ BED_REASON_PATTERNS = [
 ]
 
 stop_flag = False
+restart_requested = False
 joined = False
 connected_once = False
 process_started_at = datetime.now(timezone.utc)
@@ -222,13 +223,31 @@ def watchdog_reason(now_ts: datetime | None = None) -> str | None:
     return None
 
 
+def request_supervisor_restart(reason: str) -> None:
+    global stop_flag, restart_requested
+    restart_requested = True
+    stop_flag = True
+    log('[watchdog]', f'forcing supervisor restart reason={reason}')
+    write_state(force=True)
+    clear_pending_commands()
+    proc = process_handle
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                time.sleep(2)
+                if proc.poll() is None:
+                    proc.kill()
+        except Exception as e:
+            log('[watchdog-terminate-error]', repr(e))
+
+
 def watchdog_loop() -> None:
     while not stop_flag:
         reason = watchdog_reason()
         if reason:
-            log('[watchdog]', f'forcing supervisor restart reason={reason}')
-            write_state(force=True)
-            os._exit(17)
+            request_supervisor_restart(reason)
+            return
         time.sleep(WATCHDOG_INTERVAL_SECONDS)
 
 
@@ -489,7 +508,7 @@ def sig_handler(signum, frame) -> None:
 
 
 def main() -> int:
-    global joined, connected_once, active_after, next_bed_attempt_at, process_handle, joined_at, last_position_at, last_progress_at
+    global joined, connected_once, active_after, next_bed_attempt_at, process_handle, joined_at, last_position_at, last_progress_at, restart_requested
 
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
@@ -586,8 +605,10 @@ def main() -> int:
         reset_runtime_after_disconnect('supervisor_shutdown')
 
     rc = proc.poll()
-    log('[exit]', f'returncode={rc} connected_once={connected_once}')
+    log('[exit]', f'returncode={rc} connected_once={connected_once} restart_requested={restart_requested}')
     write_state(force=True)
+    if restart_requested:
+        return 17
     return 0 if rc in (0, None) else 1
 
 

@@ -6,7 +6,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-trap 'echo "[wrapper] received signal, exiting"; exit 0' SIGTERM SIGINT
+trap 'echo "[wrapper] received signal, terminating children and exiting"; pkill -f "MinecraftClient .*MCC_HN_PRO_MAX.ini" 2>/dev/null || true; pkill -f "python3 mcc_supervisor.py" 2>/dev/null || true; exit 0' SIGTERM SIGINT
 
 BACKOFF=5
 MAX_BACKOFF=60
@@ -23,6 +23,7 @@ start_health_server() {
 
 while true; do
   start_health_server
+  pkill -f "MinecraftClient .*MCC_HN_PRO_MAX.ini" 2>/dev/null || true
   if [ ! -x ./MinecraftClient ]; then
     echo "[$(date -u +%FT%TZ)] [wrapper] MinecraftClient missing, downloading"
     ./download_mcc.sh
@@ -35,6 +36,8 @@ while true; do
 
   if [ "$rc" -eq 0 ]; then
     BACKOFF=5
+  elif [ "$rc" -eq 17 ]; then
+    BACKOFF=8
   else
     BACKOFF=$(( BACKOFF * 2 ))
     if [ "$BACKOFF" -gt "$MAX_BACKOFF" ]; then BACKOFF=$MAX_BACKOFF; fi
