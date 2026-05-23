@@ -53,6 +53,7 @@ RAIN_STOP_RE = re.compile(r'(?:rain stopped|stopped raining|rain has stopped)', 
 THUNDER_RE = re.compile(r'(?:thunderstorm|started thundering|thunder begins)', re.I)
 THUNDER_STOP_RE = re.compile(r'(?:thunderstorm ended|stopped thundering|thunder has stopped)', re.I)
 HOSTILE_RE = re.compile(r'(Zombie|Skeleton|Creeper|Spider|Drowned|Husk|Stray|Phantom|Witch|Pillager|Vindicator|Slime|Enderman)', re.I)
+DUPLICATE_LOGIN_RE = re.compile(r'logged in from another location', re.I)
 
 BED_REASON_PATTERNS = [
     (re.compile(r'Could not find a bed', re.I), 'no_bed_found'),
@@ -102,6 +103,7 @@ MOVEMENT_INTERVAL_SECONDS = 1.15
 BED_SCAN_INTERVAL_SECONDS = 50
 CHUNK_LOAD_TARGET = 12
 REJOIN_GRACE_SECONDS = 20
+INITIAL_CONNECT_RESTART_SECONDS = 120
 NO_POSITION_UPDATE_SECONDS = 45
 NO_PROGRESS_RESTART_SECONDS = 150
 WATCHDOG_INTERVAL_SECONDS = 5
@@ -204,6 +206,10 @@ def seconds_since(ts: datetime, now_ts: datetime | None = None) -> float | None:
 
 def watchdog_reason(now_ts: datetime | None = None) -> str | None:
     t = now_ts or now()
+    if not connected_once and not joined and last_disconnect_at != datetime.min.replace(tzinfo=timezone.utc):
+        if (t - process_started_at).total_seconds() >= INITIAL_CONNECT_RESTART_SECONDS:
+            return 'initial_connect_stalled'
+        return None
     if connected_once and not joined and last_disconnect_at != datetime.min.replace(tzinfo=timezone.utc):
         if (t - last_disconnect_at).total_seconds() >= REJOIN_GRACE_SECONDS:
             return 'reconnect_timeout'
@@ -292,6 +298,7 @@ def state_payload(now_ts: datetime | None = None) -> dict:
         'watchdog': {
             'pending_restart_reason': watchdog_reason(t),
             'rejoin_grace_seconds': REJOIN_GRACE_SECONDS,
+            'initial_connect_restart_seconds': INITIAL_CONNECT_RESTART_SECONDS,
             'no_position_update_seconds': NO_POSITION_UPDATE_SECONDS,
             'no_progress_restart_seconds': NO_PROGRESS_RESTART_SECONDS,
         },
@@ -570,8 +577,16 @@ def main() -> int:
                 write_state(force=True)
                 continue
 
+            if DUPLICATE_LOGIN_RE.search(line):
+                reset_runtime_after_disconnect(line)
+                request_supervisor_restart('duplicate_login')
+                continue
+
             if DISCONNECT_RE.search(line):
                 reset_runtime_after_disconnect(line)
+                lowered = line.lower()
+                if 'cannot send text: not connected to a server' in lowered or 'connection has been lost' in lowered:
+                    request_supervisor_restart('session_desync')
                 continue
 
             if SELF_SPAWN_RE.search(line):
