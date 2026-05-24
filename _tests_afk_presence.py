@@ -16,6 +16,7 @@ def reset_state():
     mod.joined_at = datetime.now(timezone.utc) - timedelta(seconds=30)
     mod.active_after = datetime.now(timezone.utc) - timedelta(seconds=1)
     mod.next_bed_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+    mod.next_motion_at = MIN_TS
     mod.last_bed_attempt_at = MIN_TS
     mod.last_bed_reason = ''
     mod.last_bed_reason_at = MIN_TS
@@ -32,6 +33,13 @@ def reset_state():
     mod.bot_location = None
     mod.last_position_at = MIN_TS
     mod.last_progress_at = MIN_TS
+    mod.last_motion_style = 'idle'
+    mod.last_motion_command = ''
+    mod.last_motion_reason = ''
+    mod.last_move_direction = ''
+    for direction in mod.CARDINALS:
+        mod.direction_failures[direction] = 0
+        mod.direction_cooldown_until[direction] = MIN_TS
     while True:
         try:
             mod.cmd_q.get_nowait()
@@ -98,6 +106,34 @@ def test_watchdog_position_stale():
     assert mod.watchdog_reason() == 'position_updates_stalled'
 
 
+def test_available_directions_respects_cooldown():
+    reset_state()
+    mod.last_move_direction = 'north'
+    mod.direction_cooldown_until['east'] = datetime.now(timezone.utc) + timedelta(seconds=30)
+    available = mod.available_directions()
+    assert 'east' not in available
+    assert available[-1] == 'north'
+
+
+def test_motion_feedback_blocks_direction():
+    reset_state()
+    mod.last_move_direction = 'west'
+    mod.maybe_update_motion_feedback('Cannot move in that direction.')
+    assert mod.direction_failures['west'] == 1
+    assert mod.direction_cooldown_until['west'] > datetime.now(timezone.utc)
+    assert mod.last_motion_reason == 'blocked_west'
+
+
+def test_planned_actions_do_not_force_unsafe_moves():
+    reset_state()
+    for _ in range(40):
+        commands, style, reason = mod.plan_movement_action()
+        assert style
+        assert reason
+        for command in commands:
+            assert ' -f' not in command
+
+
 if __name__ == '__main__':
     test_bed_reason_awareness()
     test_player_awareness()
@@ -106,4 +142,7 @@ if __name__ == '__main__':
     test_watchdog_reconnect_timeout()
     test_watchdog_initial_connect_stalled()
     test_watchdog_position_stale()
+    test_available_directions_respects_cooldown()
+    test_motion_feedback_blocks_direction()
+    test_planned_actions_do_not_force_unsafe_moves()
     print('afk presence tests PASSED')

@@ -20,6 +20,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import signal
 import subprocess
@@ -97,9 +98,23 @@ cmd_q: queue.Queue[str] = queue.Queue()
 move_index = 0
 health_server_started = False
 joined_at = datetime.min.replace(tzinfo=timezone.utc)
+next_motion_at = datetime.min.replace(tzinfo=timezone.utc)
+last_motion_style = 'idle'
+last_motion_command = ''
+last_motion_reason = 'startup'
+last_move_direction = ''
+direction_failures = {d: 0 for d in ('north', 'east', 'south', 'west')}
+direction_cooldown_until = {d: datetime.min.replace(tzinfo=timezone.utc) for d in ('north', 'east', 'south', 'west')}
 
 AFK_MODE = 'afk_presence'
-MOVEMENT_INTERVAL_SECONDS = 1.15
+MOVEMENT_INTERVAL_SECONDS = 1.35
+SEND_INTERVAL_MIN_SECONDS = 0.55
+SEND_INTERVAL_MAX_SECONDS = 1.25
+MOVEMENT_DELAY_MIN_SECONDS = 1.6
+MOVEMENT_DELAY_MAX_SECONDS = 4.8
+MOVEMENT_LONG_PAUSE_CHANCE = 0.18
+MOVEMENT_LONG_PAUSE_MIN_SECONDS = 5.5
+MOVEMENT_LONG_PAUSE_MAX_SECONDS = 11.0
 BED_SCAN_INTERVAL_SECONDS = 50
 CHUNK_LOAD_TARGET = 12
 REJOIN_GRACE_SECONDS = 20
@@ -107,25 +122,10 @@ INITIAL_CONNECT_RESTART_SECONDS = 120
 NO_POSITION_UPDATE_SECONDS = 45
 NO_PROGRESS_RESTART_SECONDS = 150
 WATCHDOG_INTERVAL_SECONDS = 5
-
-MOVEMENT_CYCLE = [
-    '/look north',
-    '/move north -f',
-    '/move center',
-    '/animation mainhand',
-    '/look east',
-    '/move east -f',
-    '/move center',
-    '/sneak',
-    '/look south',
-    '/move south -f',
-    '/move center',
-    '/animation mainhand',
-    '/look west',
-    '/move west -f',
-    '/move center',
-    '/sneak',
-]
+DIRECTION_COOLDOWN_SECONDS = 24
+FAILURE_COOLDOWN_STEP_SECONDS = 12
+CARDINALS = ('north', 'east', 'south', 'west')
+LOOK_ONLY_ACTIONS = ['/sneak', '/animation mainhand', '/move center']
 
 
 def now() -> datetime:
@@ -187,13 +187,98 @@ def translate_bed_reason(line: str) -> str:
     return ''
 
 
+def available_directions(now_ts: datetime | None = None) -> list[str]:
+    t = now_ts or now()
+    candidates = [d for d in CARDINALS if direction_cooldown_until[d] <= t]
+    if not candidates:
+        soonest = min(direction_cooldown_until.values())
+        if soonest > datetime.min.replace(tzinfo=timezone.utc):
+            for d in CARDINALS:
+                direction_cooldown_until[d] = t
+        candidates = list(CARDINALS)
+    if last_move_direction in candidates and len(candidates) > 1:
+        reordered = [d for d in candidates if d != last_move_direction]
+        reordered.append(last_move_direction)
+        return reordered
+    return candidates
+
+
+def schedule_next_motion(base_seconds: float | None = None) -> None:
+    global next_motion_at
+    delay = base_seconds if base_seconds is not None else random.uniform(MOVEMENT_DELAY_MIN_SECONDS, MOVEMENT_DELAY_MAX_SECONDS)
+    if random.random() < MOVEMENT_LONG_PAUSE_CHANCE:
+        delay += random.uniform(MOVEMENT_LONG_PAUSE_MIN_SECONDS, MOVEMENT_LONG_PAUSE_MAX_SECONDS)
+    next_motion_at = now() + timedelta(seconds=delay)
+
+
+def register_move_attempt(cmd: str) -> None:
+    global last_move_direction, last_motion_command
+    last_motion_command = cmd
+    if not cmd.startswith('/move '):
+        return
+    parts = cmd.split()
+    if len(parts) < 2:
+        return
+    direction = parts[1].strip().lower()
+    if direction in CARDINALS:
+        last_move_direction = direction
+
+
+def plan_movement_action(now_ts: datetime | None = None) -> tuple[list[str], str, str]:
+    t = now_ts or now()
+    candidates = available_directions(t)
+    primary = random.choice(candidates)
+    secondary_pool = [d for d in candidates if d != primary]
+    secondary = random.choice(secondary_pool) if secondary_pool else primary
+    player_recent = last_seen_player_at != datetime.min.replace(tzinfo=timezone.utc) and (t - last_seen_player_at).total_seconds() <= 90
+    hostile_recent = last_hostile_at != datetime.min.replace(tzinfo=timezone.utc) and (t - last_hostile_at).total_seconds() <= 45
+
+    roll = random.random()
+    if hostile_recent:
+        roll = min(0.20, roll)
+    elif player_recent:
+        roll = max(0.18, roll)
+
+    if roll < 0.14:
+        return [f'/look {primary}'], 'look_only', 'scan_room'
+    if roll < 0.54:
+        cmds = [f'/look {primary}', f'/move {primary}']
+        if random.random() < 0.65:
+            cmds.append('/move get')
+        return cmds, 'walk', 'primary_walk'
+    if roll < 0.72:
+        cmds = [f'/look {primary}', f'/move {secondary}']
+        if random.random() < 0.5:
+            cmds.append('/move get')
+        return cmds, 'sidestep', 'space_probe'
+    if roll < 0.86:
+        return [random.choice(LOOK_ONLY_ACTIONS)], 'micro_idle', 'human_pause'
+    cmds = ['/move center']
+    if random.random() < 0.6:
+        cmds.insert(0, f'/look {primary}')
+    if random.random() < 0.5:
+        cmds.append('/move get')
+    return cmds, 'reset', 'recenter'
+
+
 def movement_state(now_ts: datetime | None = None) -> dict:
     t = now_ts or now()
     moving = last_progress_at != datetime.min.replace(tzinfo=timezone.utc) and (t - last_progress_at).total_seconds() < 8
+    next_action_in = None if next_motion_at == datetime.min.replace(tzinfo=timezone.utc) else max(0, int((next_motion_at - t).total_seconds()))
+    blocked_directions = {
+        d: max(0, int((until - t).total_seconds()))
+        for d, until in direction_cooldown_until.items()
+        if until > t
+    }
     return {
         'moving': moving,
         'seconds_since_progress': None if last_progress_at == datetime.min.replace(tzinfo=timezone.utc) else int((t - last_progress_at).total_seconds()),
         'last_progress_at': iso_or_none(last_progress_at),
+        'style': last_motion_style,
+        'last_command': last_motion_command or None,
+        'last_reason': last_motion_reason or None,
+        'next_action_in_seconds': next_action_in,
+        'blocked_directions': blocked_directions,
     }
 
 
@@ -366,15 +451,16 @@ def send_loop(proc: subprocess.Popen) -> None:
             assert proc.stdin is not None
             proc.stdin.write(cmd + '\n')
             proc.stdin.flush()
+            register_move_attempt(cmd)
             log('[send]', cmd)
         except Exception as e:
             log('[send-error]', repr(e))
             break
-        time.sleep(MOVEMENT_INTERVAL_SECONDS)
+        time.sleep(random.uniform(SEND_INTERVAL_MIN_SECONDS, SEND_INTERVAL_MAX_SECONDS))
 
 
 def movement_loop() -> None:
-    global move_index, next_bed_attempt_at, last_bed_attempt_at
+    global move_index, next_bed_attempt_at, last_bed_attempt_at, next_motion_at, last_motion_style, last_motion_reason
     while not stop_flag:
         t = now()
         if joined and t >= active_after:
@@ -384,22 +470,34 @@ def movement_loop() -> None:
                 next_bed_attempt_at = t + timedelta(seconds=BED_SCAN_INTERVAL_SECONDS)
                 write_state(force=True)
 
-            enqueue(MOVEMENT_CYCLE[move_index % len(MOVEMENT_CYCLE)])
-            if move_index % 2 == 0:
-                enqueue('/move get')
-            move_index += 1
-            write_state()
-        time.sleep(MOVEMENT_INTERVAL_SECONDS)
+            if next_motion_at == datetime.min.replace(tzinfo=timezone.utc) or t >= next_motion_at:
+                cmds, style, reason = plan_movement_action(t)
+                for cmd in cmds:
+                    enqueue(cmd)
+                last_motion_style = style
+                last_motion_reason = reason
+                move_index += 1
+                schedule_next_motion()
+                write_state(force=True)
+        time.sleep(0.35)
 
 
 def reset_runtime_after_disconnect(reason: str = '') -> None:
-    global joined, active_after, last_disconnect_reason, last_disconnect_at, joined_at, bot_location, last_position_at, last_progress_at
+    global joined, active_after, next_motion_at, last_disconnect_reason, last_disconnect_at, joined_at, bot_location, last_position_at, last_progress_at, last_motion_style, last_motion_command, last_motion_reason, last_move_direction
     joined = False
     joined_at = datetime.min.replace(tzinfo=timezone.utc)
     active_after = datetime.min.replace(tzinfo=timezone.utc)
+    next_motion_at = datetime.min.replace(tzinfo=timezone.utc)
     bot_location = None
     last_position_at = datetime.min.replace(tzinfo=timezone.utc)
     last_progress_at = datetime.min.replace(tzinfo=timezone.utc)
+    last_motion_style = 'idle'
+    last_motion_command = ''
+    last_motion_reason = 'disconnected'
+    last_move_direction = ''
+    for direction in CARDINALS:
+        direction_failures[direction] = 0
+        direction_cooldown_until[direction] = datetime.min.replace(tzinfo=timezone.utc)
     clear_pending_commands()
     if reason:
         last_disconnect_reason = reason
@@ -408,7 +506,7 @@ def reset_runtime_after_disconnect(reason: str = '') -> None:
 
 
 def maybe_update_location(line: str) -> None:
-    global bot_location, last_position_at, last_progress_at
+    global bot_location, last_position_at, last_progress_at, last_motion_reason
     m = LOCATION_RE.search(line)
     if not m:
         return
@@ -421,6 +519,11 @@ def maybe_update_location(line: str) -> None:
     last_position_at = now()
     if previous is None or distance_3d(previous, new_loc) >= 0.15:
         last_progress_at = last_position_at
+        if last_move_direction in direction_failures:
+            direction_failures[last_move_direction] = 0
+            direction_cooldown_until[last_move_direction] = datetime.min.replace(tzinfo=timezone.utc)
+        if last_motion_style in {'walk', 'sidestep'}:
+            last_motion_reason = 'progress_confirmed'
     write_state()
 
 
@@ -508,6 +611,23 @@ def maybe_update_hostile_awareness(line: str) -> None:
         write_state()
 
 
+def maybe_update_motion_feedback(line: str) -> None:
+    global last_motion_reason
+    lowered = line.lower()
+    if 'cannot move in that direction' in lowered and last_move_direction in direction_failures:
+        direction_failures[last_move_direction] += 1
+        cooldown = DIRECTION_COOLDOWN_SECONDS + ((direction_failures[last_move_direction] - 1) * FAILURE_COOLDOWN_STEP_SECONDS)
+        direction_cooldown_until[last_move_direction] = now() + timedelta(seconds=cooldown)
+        last_motion_reason = f'blocked_{last_move_direction}'
+        schedule_next_motion(base_seconds=random.uniform(2.5, 4.5))
+        write_state(force=True)
+        return
+    if 'you are dead' in lowered or 'was slain by' in lowered or 'died' in lowered:
+        last_motion_reason = 'death_pause'
+        schedule_next_motion(base_seconds=random.uniform(8.0, 12.0))
+        write_state(force=True)
+
+
 def sig_handler(signum, frame) -> None:
     global stop_flag
     stop_flag = True
@@ -515,7 +635,7 @@ def sig_handler(signum, frame) -> None:
 
 
 def main() -> int:
-    global joined, connected_once, active_after, next_bed_attempt_at, process_handle, joined_at, last_position_at, last_progress_at, restart_requested
+    global joined, connected_once, active_after, next_bed_attempt_at, next_motion_at, process_handle, joined_at, last_position_at, last_progress_at, restart_requested, last_motion_style, last_motion_reason
 
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
@@ -570,8 +690,11 @@ def main() -> int:
                 joined_at = join_ts
                 active_after = join_ts + timedelta(seconds=8)
                 next_bed_attempt_at = join_ts + timedelta(seconds=20)
+                next_motion_at = join_ts + timedelta(seconds=random.uniform(9.5, 13.5))
                 last_position_at = datetime.min.replace(tzinfo=timezone.utc)
                 last_progress_at = datetime.min.replace(tzinfo=timezone.utc)
+                last_motion_style = 'warmup'
+                last_motion_reason = 'joined_server'
                 clear_pending_commands()
                 enqueue('/move get')
                 write_state(force=True)
@@ -598,6 +721,7 @@ def main() -> int:
             maybe_update_bed_awareness(line)
             maybe_update_player_awareness(line)
             maybe_update_hostile_awareness(line)
+            maybe_update_motion_feedback(line)
     except Exception as e:
         log('[main-loop-error]', repr(e))
     finally:
