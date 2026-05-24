@@ -136,7 +136,7 @@ DIRECTION_COOLDOWN_SECONDS = 24
 FAILURE_COOLDOWN_STEP_SECONDS = 12
 ANCHOR_DRIFT_LIMIT = 1.15
 CARDINALS = ('north', 'east', 'south', 'west')
-LOOK_ONLY_ACTIONS = ['/sneak', '/animation mainhand', '/move center', '/move off']
+LOOK_ONLY_ACTIONS = ['/sneak', '/animation mainhand', '/move center']
 
 
 def now() -> datetime:
@@ -214,6 +214,19 @@ def available_directions(now_ts: datetime | None = None) -> list[str]:
     return candidates
 
 
+def choose_bed_radius() -> int:
+    global bed_search_radius
+    if last_bed_reason in {'no_bed_found', 'bed_path_timeout', 'bed_not_safe', 'bed_too_far', 'not_a_bed'}:
+        try:
+            idx = BED_SEARCH_RADII.index(bed_search_radius)
+        except ValueError:
+            idx = 0
+        bed_search_radius = BED_SEARCH_RADII[min(idx + 1, len(BED_SEARCH_RADII) - 1)]
+    else:
+        bed_search_radius = BED_SEARCH_RADII[0]
+    return bed_search_radius
+
+
 def schedule_next_motion(base_seconds: float | None = None) -> None:
     global next_motion_at
     delay = base_seconds if base_seconds is not None else random.uniform(MOVEMENT_DELAY_MIN_SECONDS, MOVEMENT_DELAY_MAX_SECONDS)
@@ -248,8 +261,18 @@ def plan_movement_action(now_ts: datetime | None = None) -> tuple[list[str], str
         dx = bot_location[0] - movement_anchor[0]
         dz = bot_location[2] - movement_anchor[2]
         if abs(dx) >= ANCHOR_DRIFT_LIMIT or abs(dz) >= ANCHOR_DRIFT_LIMIT:
-            ax, ay, az = movement_anchor
-            return [f'/look {primary}', '/move off', f'/move {ax:.2f} {ay:.2f} {az:.2f}', '/move get'], 'recover', 'return_to_anchor'
+            recover_dir = primary
+            if abs(dx) >= abs(dz):
+                if dx > 0 and 'west' in candidates:
+                    recover_dir = 'west'
+                elif dx < 0 and 'east' in candidates:
+                    recover_dir = 'east'
+            else:
+                if dz > 0 and 'north' in candidates:
+                    recover_dir = 'north'
+                elif dz < 0 and 'south' in candidates:
+                    recover_dir = 'south'
+            return [f'/look {recover_dir}', f'/move {recover_dir}', '/move center', '/move get'], 'recover', 'return_to_anchor'
         if dx > 0.40 and 'west' in candidates:
             primary = 'west'
         elif dx < -0.40 and 'east' in candidates:
@@ -268,18 +291,18 @@ def plan_movement_action(now_ts: datetime | None = None) -> tuple[list[str], str
     if roll < 0.20:
         return [f'/look {primary}', '/move get'], 'look_only', 'scan_room'
     if roll < 0.48:
-        cmds = [f'/look {primary}', f'/move {primary}', random.choice(['/move off', '/move center'])]
+        cmds = [f'/look {primary}', f'/move {primary}', '/move center']
         if random.random() < 0.55:
             cmds.append('/move get')
         return cmds, 'walk', 'short_walk'
     if roll < 0.60:
-        cmds = [f'/look {primary}', f'/move {secondary}', random.choice(['/move off', '/move center'])]
+        cmds = [f'/look {primary}', f'/move {secondary}', '/move center']
         if random.random() < 0.45:
             cmds.append('/move get')
         return cmds, 'sidestep', 'space_probe'
     if roll < 0.82:
         return [random.choice(LOOK_ONLY_ACTIONS)], 'micro_idle', 'human_pause'
-    cmds = ['/move off', '/move center']
+    cmds = ['/move center']
     if random.random() < 0.55:
         cmds.insert(0, f'/look {primary}')
     if random.random() < 0.35:
@@ -548,7 +571,7 @@ def maybe_update_location(line: str) -> None:
         return
     previous = bot_location
     bot_location = new_loc
-    if movement_anchor is None and joined:
+    if movement_anchor is None and joined and new_loc != (0.0, 0.0, 0.0):
         movement_anchor = new_loc
     last_position_at = now()
     if previous is None or distance_3d(previous, new_loc) >= 0.15:
