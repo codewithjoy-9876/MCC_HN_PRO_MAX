@@ -55,6 +55,7 @@ THUNDER_RE = re.compile(r'(?:thunderstorm|started thundering|thunder begins)', r
 THUNDER_STOP_RE = re.compile(r'(?:thunderstorm ended|stopped thundering|thunder has stopped)', re.I)
 HOSTILE_RE = re.compile(r'(Zombie|Skeleton|Creeper|Spider|Drowned|Husk|Stray|Phantom|Witch|Pillager|Vindicator|Slime|Enderman)', re.I)
 DUPLICATE_LOGIN_RE = re.compile(r'logged in from another location', re.I)
+CANNOT_MOVE_RE = re.compile(r'Cannot move(?:\s+(north|east|south|west|up|down))?|Cannot move in that direction', re.I)
 
 BED_REASON_PATTERNS = [
     (re.compile(r'Could not find a bed', re.I), 'no_bed_found'),
@@ -98,6 +99,13 @@ cmd_q: queue.Queue[str] = queue.Queue()
 move_index = 0
 health_server_started = False
 joined_at = datetime.min.replace(tzinfo=timezone.utc)
+movement_anchor: tuple[float, float, float] | None = None
+last_move_direction = ''
+blocked_directions: dict[str, datetime] = {}
+pending_followup_command = ''
+pending_followup_at = datetime.min.replace(tzinfo=timezone.utc)
+next_action_at = datetime.min.replace(tzinfo=timezone.utc)
+bed_search_radius = 8
 next_motion_at = datetime.min.replace(tzinfo=timezone.utc)
 last_motion_style = 'idle'
 last_motion_command = ''
@@ -116,6 +124,8 @@ MOVEMENT_LONG_PAUSE_CHANCE = 0.18
 MOVEMENT_LONG_PAUSE_MIN_SECONDS = 5.5
 MOVEMENT_LONG_PAUSE_MAX_SECONDS = 11.0
 BED_SCAN_INTERVAL_SECONDS = 50
+BED_SCAN_JITTER_SECONDS = 16
+BED_SEARCH_RADII = [8, 12, 20]
 CHUNK_LOAD_TARGET = 12
 REJOIN_GRACE_SECONDS = 20
 INITIAL_CONNECT_RESTART_SECONDS = 120
@@ -124,8 +134,9 @@ NO_PROGRESS_RESTART_SECONDS = 150
 WATCHDOG_INTERVAL_SECONDS = 5
 DIRECTION_COOLDOWN_SECONDS = 24
 FAILURE_COOLDOWN_STEP_SECONDS = 12
+ANCHOR_DRIFT_LIMIT = 1.15
 CARDINALS = ('north', 'east', 'south', 'west')
-LOOK_ONLY_ACTIONS = ['/sneak', '/animation mainhand', '/move center']
+LOOK_ONLY_ACTIONS = ['/sneak', '/animation mainhand', '/move center', '/move off']
 
 
 def now() -> datetime:
@@ -233,30 +244,45 @@ def plan_movement_action(now_ts: datetime | None = None) -> tuple[list[str], str
     player_recent = last_seen_player_at != datetime.min.replace(tzinfo=timezone.utc) and (t - last_seen_player_at).total_seconds() <= 90
     hostile_recent = last_hostile_at != datetime.min.replace(tzinfo=timezone.utc) and (t - last_hostile_at).total_seconds() <= 45
 
+    if movement_anchor is not None and bot_location is not None:
+        dx = bot_location[0] - movement_anchor[0]
+        dz = bot_location[2] - movement_anchor[2]
+        if abs(dx) >= ANCHOR_DRIFT_LIMIT or abs(dz) >= ANCHOR_DRIFT_LIMIT:
+            ax, ay, az = movement_anchor
+            return [f'/look {primary}', '/move off', f'/move {ax:.2f} {ay:.2f} {az:.2f}', '/move get'], 'recover', 'return_to_anchor'
+        if dx > 0.40 and 'west' in candidates:
+            primary = 'west'
+        elif dx < -0.40 and 'east' in candidates:
+            primary = 'east'
+        elif dz > 0.40 and 'north' in candidates:
+            primary = 'north'
+        elif dz < -0.40 and 'south' in candidates:
+            primary = 'south'
+
     roll = random.random()
     if hostile_recent:
-        roll = min(0.20, roll)
+        roll = min(0.12, roll)
     elif player_recent:
-        roll = max(0.18, roll)
+        roll = max(0.28, roll)
 
-    if roll < 0.14:
-        return [f'/look {primary}'], 'look_only', 'scan_room'
-    if roll < 0.54:
-        cmds = [f'/look {primary}', f'/move {primary}']
-        if random.random() < 0.65:
+    if roll < 0.20:
+        return [f'/look {primary}', '/move get'], 'look_only', 'scan_room'
+    if roll < 0.48:
+        cmds = [f'/look {primary}', f'/move {primary}', random.choice(['/move off', '/move center'])]
+        if random.random() < 0.55:
             cmds.append('/move get')
-        return cmds, 'walk', 'primary_walk'
-    if roll < 0.72:
-        cmds = [f'/look {primary}', f'/move {secondary}']
-        if random.random() < 0.5:
+        return cmds, 'walk', 'short_walk'
+    if roll < 0.60:
+        cmds = [f'/look {primary}', f'/move {secondary}', random.choice(['/move off', '/move center'])]
+        if random.random() < 0.45:
             cmds.append('/move get')
         return cmds, 'sidestep', 'space_probe'
-    if roll < 0.86:
+    if roll < 0.82:
         return [random.choice(LOOK_ONLY_ACTIONS)], 'micro_idle', 'human_pause'
-    cmds = ['/move center']
-    if random.random() < 0.6:
+    cmds = ['/move off', '/move center']
+    if random.random() < 0.55:
         cmds.insert(0, f'/look {primary}')
-    if random.random() < 0.5:
+    if random.random() < 0.35:
         cmds.append('/move get')
     return cmds, 'reset', 'recenter'
 
@@ -279,6 +305,8 @@ def movement_state(now_ts: datetime | None = None) -> dict:
         'last_reason': last_motion_reason or None,
         'next_action_in_seconds': next_action_in,
         'blocked_directions': blocked_directions,
+        'anchor_location': movement_anchor,
+        'bed_search_radius': bed_search_radius,
     }
 
 
@@ -465,9 +493,11 @@ def movement_loop() -> None:
         t = now()
         if joined and t >= active_after:
             if t >= next_bed_attempt_at:
-                enqueue('/bed sleep 8')
+                radius = choose_bed_radius()
+                enqueue('/move get')
+                enqueue(f'/bed sleep {radius}')
                 last_bed_attempt_at = t
-                next_bed_attempt_at = t + timedelta(seconds=BED_SCAN_INTERVAL_SECONDS)
+                next_bed_attempt_at = t + timedelta(seconds=BED_SCAN_INTERVAL_SECONDS + random.uniform(-BED_SCAN_JITTER_SECONDS, BED_SCAN_JITTER_SECONDS))
                 write_state(force=True)
 
             if next_motion_at == datetime.min.replace(tzinfo=timezone.utc) or t >= next_motion_at:
@@ -483,12 +513,14 @@ def movement_loop() -> None:
 
 
 def reset_runtime_after_disconnect(reason: str = '') -> None:
-    global joined, active_after, next_motion_at, last_disconnect_reason, last_disconnect_at, joined_at, bot_location, last_position_at, last_progress_at, last_motion_style, last_motion_command, last_motion_reason, last_move_direction
+    global joined, active_after, next_motion_at, last_disconnect_reason, last_disconnect_at, joined_at, bot_location, last_position_at, last_progress_at, last_motion_style, last_motion_command, last_motion_reason, last_move_direction, movement_anchor, bed_search_radius
     joined = False
     joined_at = datetime.min.replace(tzinfo=timezone.utc)
     active_after = datetime.min.replace(tzinfo=timezone.utc)
     next_motion_at = datetime.min.replace(tzinfo=timezone.utc)
     bot_location = None
+    movement_anchor = None
+    bed_search_radius = BED_SEARCH_RADII[0]
     last_position_at = datetime.min.replace(tzinfo=timezone.utc)
     last_progress_at = datetime.min.replace(tzinfo=timezone.utc)
     last_motion_style = 'idle'
@@ -506,7 +538,7 @@ def reset_runtime_after_disconnect(reason: str = '') -> None:
 
 
 def maybe_update_location(line: str) -> None:
-    global bot_location, last_position_at, last_progress_at, last_motion_reason
+    global bot_location, last_position_at, last_progress_at, last_motion_reason, movement_anchor
     m = LOCATION_RE.search(line)
     if not m:
         return
@@ -516,6 +548,8 @@ def maybe_update_location(line: str) -> None:
         return
     previous = bot_location
     bot_location = new_loc
+    if movement_anchor is None and joined:
+        movement_anchor = new_loc
     last_position_at = now()
     if previous is None or distance_3d(previous, new_loc) >= 0.15:
         last_progress_at = last_position_at
@@ -545,7 +579,7 @@ def maybe_update_weather(line: str) -> None:
 
 
 def maybe_update_bed_awareness(line: str) -> None:
-    global last_bed_reason, last_bed_reason_at, next_bed_attempt_at, last_weather_hint, last_weather_at, last_sleep_success_at
+    global last_bed_reason, last_bed_reason_at, next_bed_attempt_at, last_weather_hint, last_weather_at, last_sleep_success_at, bed_search_radius
     reason = translate_bed_reason(line)
     if reason:
         last_bed_reason = reason
@@ -556,11 +590,15 @@ def maybe_update_bed_awareness(line: str) -> None:
             next_bed_attempt_at = now() + timedelta(seconds=75)
         elif reason == 'monsters_nearby':
             next_bed_attempt_at = now() + timedelta(seconds=30)
+        elif reason in {'no_bed_found', 'bed_path_timeout', 'bed_not_safe', 'bed_too_far', 'not_a_bed'}:
+            choose_bed_radius()
+            next_bed_attempt_at = now() + timedelta(seconds=18)
         write_state(force=True)
         return
     if 'sleep' in line.lower() and ('leave bed' in line.lower() or 'lay in bed' in line.lower() or 'sleeping' in line.lower()):
         last_sleep_success_at = now()
         last_bed_reason = ''
+        bed_search_radius = BED_SEARCH_RADII[0]
         write_state(force=True)
 
 
@@ -635,7 +673,7 @@ def sig_handler(signum, frame) -> None:
 
 
 def main() -> int:
-    global joined, connected_once, active_after, next_bed_attempt_at, next_motion_at, process_handle, joined_at, last_position_at, last_progress_at, restart_requested, last_motion_style, last_motion_reason
+    global joined, connected_once, active_after, next_bed_attempt_at, next_motion_at, process_handle, joined_at, last_position_at, last_progress_at, restart_requested, last_motion_style, last_motion_reason, movement_anchor, bed_search_radius
 
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
@@ -688,9 +726,11 @@ def main() -> int:
                 joined = True
                 connected_once = True
                 joined_at = join_ts
-                active_after = join_ts + timedelta(seconds=8)
-                next_bed_attempt_at = join_ts + timedelta(seconds=20)
-                next_motion_at = join_ts + timedelta(seconds=random.uniform(9.5, 13.5))
+                movement_anchor = None
+                bed_search_radius = BED_SEARCH_RADII[0]
+                active_after = join_ts + timedelta(seconds=10)
+                next_bed_attempt_at = join_ts + timedelta(seconds=22)
+                next_motion_at = join_ts + timedelta(seconds=random.uniform(11.0, 16.0))
                 last_position_at = datetime.min.replace(tzinfo=timezone.utc)
                 last_progress_at = datetime.min.replace(tzinfo=timezone.utc)
                 last_motion_style = 'warmup'
