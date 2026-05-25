@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-CONFIG = os.path.join(BASE, 'MCC_HN_PRO_MAX.ini')
+CONFIG = os.getenv('MCC_CONFIG_PATH', os.path.join(BASE, 'MCC_HN_PRO_MAX.ini'))
 MCC = os.path.join(BASE, 'MinecraftClient')
 LOG = os.path.join(BASE, 'supervisor_runtime.log')
 STATE_JSON = os.path.join(BASE, 'presence_state.json')
