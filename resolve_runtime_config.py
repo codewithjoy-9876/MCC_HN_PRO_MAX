@@ -1,18 +1,39 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import socket
 import sys
+import urllib.request
 from pathlib import Path
 
 SERVER_RE = re.compile(r'Server\s*=\s*\{\s*Host\s*=\s*"([^"]+)"\s*,\s*Port\s*=\s*(\d+)\s*\}')
 SECTION_RE = re.compile(r'^\[(.+?)\]\s*$')
 
 
-def resolve_ip(host: str, port: int) -> str | None:
+def resolve_via_doh(host: str) -> str | None:
+    providers = [
+        ('google', f'https://dns.google/resolve?name={host}&type=A'),
+        ('cloudflare', f'https://cloudflare-dns.com/dns-query?name={host}&type=A'),
+    ]
+    for provider_name, url in providers:
+        try:
+            request = urllib.request.Request(url, headers={'accept': 'application/dns-json'})
+            with urllib.request.urlopen(request, timeout=8) as response:
+                payload = json.load(response)
+            answers = [item.get('data') for item in payload.get('Answer', []) if item.get('type') == 1 and item.get('data')]
+            if answers:
+                print(f'[resolver] doh provider={provider_name} host={host} ip={answers[0]}')
+                return answers[0]
+        except Exception as exc:
+            print(f'[resolver] doh provider={provider_name} host={host} error={exc!r}')
+    return None
+
+
+def resolve_via_system(host: str, port: int) -> str | None:
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except Exception:
@@ -29,6 +50,10 @@ def resolve_ip(host: str, port: int) -> str | None:
         if ip:
             return ip
     return None
+
+
+def resolve_ip(host: str, port: int) -> str | None:
+    return resolve_via_doh(host) or resolve_via_system(host, port)
 
 
 def main() -> int:
