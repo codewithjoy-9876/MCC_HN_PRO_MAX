@@ -1,5 +1,5 @@
 # HN_PRO_MAX production Dockerfile (Railway-ready)
-# Downloads the MCC binary at build time so the GitHub repo stays small.
+# Prefer the bundled MCC binary from the repository; download only if it's missing.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -20,19 +20,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Fetch the official Minecraft Console Client binary (Linux x64, latest stable)
-# Reference: https://mccteam.github.io/guide/installation.html
-RUN curl -fsSL https://mccteam.github.io/install.sh | sh \
-    && ls -lh /app/MinecraftClient \
-    && chmod +x /app/MinecraftClient
-
-# Copy supervisor + config + helpers
+# Copy supervisor + config + helpers + bundled MCC binary (if present in repo)
 COPY . /app
 
-RUN chmod +x /app/run_forever.sh /app/start_bot.sh /app/download_mcc.sh /app/install_mcc.sh || true \
-    && /app/download_mcc.sh \
+RUN chmod +x /app/run_forever.sh /app/start_bot.sh /app/download_mcc.sh /app/install_mcc.sh /app/resolve_runtime_config.py || true \
+    && if [ ! -x /app/MinecraftClient ]; then /app/download_mcc.sh; else echo "Using bundled MinecraftClient from repository"; fi \
     && chmod +x /app/MinecraftClient || true \
-    && python3 -m py_compile /app/mcc_supervisor.py /app/health_server.py
+    && ls -lh /app/MinecraftClient \
+    && python3 -m py_compile /app/mcc_supervisor.py /app/health_server.py /app/resolve_runtime_config.py
 
 EXPOSE 8080
 
